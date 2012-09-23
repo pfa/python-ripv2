@@ -438,7 +438,8 @@ class RIPRouteEntry(object):
         elif address and \
              mask    and \
              nexthop and \
-             metric:
+             metric != None and \
+             tag    != None:
             self._init_from_host(address, mask, nexthop, metric, tag)
         else:
             raise(ValueError)
@@ -527,13 +528,13 @@ def parse_args(argv):
     return options, arguments
 
 def main(argv):
+    options, arguments = parse_args(argv)
+
     # Must run as root to manipulate the routing table.
     userid = subprocess.check_output("id -u".split()).rstrip()
     if userid != "0":
         sys.stderr.write("Must run as root. Exiting.\n")
         sys.exit(1)
-
-    options, arguments = parse_args(argv)
 
     ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config)
     reactor.listenMulticast(options.port, ripserv)
