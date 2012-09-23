@@ -5,6 +5,7 @@ import ipaddr
 import sys
 import subprocess
 import re
+import optparse
 from twisted.internet import protocol
 from twisted.internet import reactor
 import logging
@@ -14,48 +15,97 @@ class RIP(protocol.DatagramProtocol):
     TYPE_REQUEST = 1
     TYPE_RESPONSE = 2
 
-    def __init__(self, routelist=None, importroutes=False):
+    def __init__(self, user_routes=None, importroutes=False, requested_ifaces=None):
         """
-        routelist -- A list of routes to advertise
-        importroutes -- Look in the main kernel routing table for routes to
-        import into RIP during startup.
+        user_routes -- A list of routes to advertise.
+        importroutes -- If True, look in the main kernel routing table for
+            routes to import into RIP during startup.
+        requested_ifaces -- A list of interface names to send updates out of.
+            If None, use all interfaces.
         """
-        if routelist:
-            self._routes = routelist
-        else:
-            self._routes = []
+        self._sys = RIPSystem()
+
+        self._routes = []
+        if user_routes:
+            metric = 0
+            tag = 0
+
+            # Nexthop of 0.0.0.0 tells receivers to use the source IP on the
+            # packet for the nexthop address. See RFC 2453 section 4.4.
+            nexthop = "0.0.0.0"
+
+            for route in user_routes:
+                parsed_rt = ipaddr.IPv4Network(route)
+                rte = RIPRouteEntry(address=parsed_rt.ip.exploded,
+                                    mask=parsed_rt.netmask.exploded,
+                                    nexthop=nexthop,
+                                    metric=metric,
+                                    tag=tag)
+                self._routes.append(rte)
 
         if importroutes:
             for rt in self._sys.get_local_routes():
                 if rt not in self._routes:
                     self._routes.append(rt)
 
-        self._sys = RIPSystem()
+        self.activate_ifaces(requested_ifaces)
 
         # Use callWhenRunning so update jitter can be introduced later on.
         reactor.callWhenRunning(self.send_update)
         reactor.callWhenRunning(self.validate_routes)
-        for interface in self._sys.get_interface_info():
-            reactor.listenMulticast(520, self, interface=interface,
-                                    listenMultiple=True)
-        reactor.run()
+
+    def activate_ifaces(self, requested_ifaces):
+        """Enable RIP processing on the given IPs/interfaces.
+        requested_ifaces -- A list of IP addresses to use"""
+        if not requested_ifaces:
+            raise(ValueError("Need one or more interface IPs to listen on."))
+
+        usable_sys_ifaces = []
+        for sys_iface in self._sys.logical_ifaces:
+            if sys_iface.usable():
+                logging.warn("Iface %s is usable." % sys_iface.phy_iface.name)
+                usable_sys_ifaces.append(sys_iface)
+
+        for req_iface in requested_ifaces:
+            activated_iface = False
+            for sys_iface in usable_sys_ifaces:
+                if req_iface == sys_iface.ip.ip.exploded:
+                    sys_iface.activated = True
+                    activated_iface = True
+                    break
+            if activated_iface == False:
+                raise(ValueError("Requested IP %s is unusable. "
+                      " (Is it assigned to this machine on an interface that "
+                      "is 'up'?)" % req_iface))
+
+    def use_iface(self, iface):
+        """Determine if an interface can be used for RIP"""
+        if self.active_ifaces != None:
+            if iface in self.active_ifaces:
+                return True
+        return iface.usable()
 
     def startProtocol(self):
-        self.transport.joinGroup("224.0.0.9")
+        for iface in self._sys.logical_ifaces:
+            if iface.activated == True:
+                self.transport.joinGroup("224.0.0.9", iface.ip.ip.exploded)
 
     def send_update(self):
         """
         Send an update message across the network.
         XXX -- Does not deal with >25 routes correctly.
         """
+        logging.warn("Sending an update.")
         msg = RIPHeader(cmd=self.TYPE_RESPONSE, ver=2).serialize()
         for rt in self._routes:
-            # XXX Update to get the local IP to use as the next hop.
-            # 0.0.0.0 means the receiving router should use the source addr of
-            # the packet as the next hop. See RFC 2453 section 4.4.
-            msg += RIPRouteEntry(rawdata=None, address=rt.network.exploded, mask=rt.netmask.exploded, nexthop="0.0.0.0", metric=0).serialize()
-        self.transport.write(msg, ("224.0.0.9", 520))
-        reactor.callLater(10, self.send_update)
+            msg += rt.serialize()
+
+        for iface in self._sys.logical_ifaces:
+            if iface.activated:
+                self.transport.setOutgoingInterface(iface.ip.ip.exploded)
+                self.transport.write(msg, ("224.0.0.9", 520))
+
+        reactor.callLater(5, self.send_update)
 
     def datagramReceived(self, data, (host, port)):
         if port != 520:
@@ -137,26 +187,30 @@ class RIPSystem(object):
         except subprocess.CalledProcessError:
             raise #(ModifyRouteError("rule_install"))
 
-        # XXX -- This only gets the first IP address from the first interface
-        # reported by ifconfig. Good enough for now.
-        self.ifaces = self.get_interface_info()
-        #self.local_addrs = [subprocess.check_output("ifconfig").split("\n")[1].split()[1][5:]]
+        self.update_interface_info()
+        self.loopback = "127.0.0.1"
 
-    def get_interface_info(self):
-        """Returns a list of local network interface names and IPs. Each
-        item in the list is a (name, [IP, IP...]) tuple. Multiple IPs may
-        be assigned to the interface."""
+    def update_interface_info(self):
+        """Updates self according to the current state of physical and logical
+        IP interfaces on the device."""
         ip_output = subprocess.check_output("ip addr show".split())
-        raw_iface_list = re.split("\nd*:", ip_addr_output)
+        raw_ifaces = re.split("\n\d*: ", ip_output)
 
         # First interface does not start with a newline, so strip the interface
         # index.
-        raw_ifaces[0] = raw_iface_list[0].lstrip("1: ")
+        raw_ifaces[0] = raw_ifaces[0].lstrip("1: ")
 
-        parsed_ifaces = []
-        for iface in raw_iface_list:
-            name = 
-            addresses = 
+        self.phy_ifaces = []
+        self.logical_ifaces = []
+        for iface in raw_ifaces:
+            name = re.match("(.*):", iface).group(1)
+            flags = re.search("<(\S*)> ", iface).group(1).split(",")
+            addrs = []
+            phy_iface = LinuxPhysicalInterface(name, flags)
+            self.phy_ifaces.append(phy_iface)
+            for addr in re.findall("\n\s*inet (\S*)", iface):
+                logical_iface = LinuxLogicalInterface(phy_iface, addr)
+                self.logical_ifaces.append(logical_iface)
 
     def uninstall_route(self, net, mask):
         cmd = [self.DEFAULT_IP_CMD] + ("route del %s/%s table %d" % \
@@ -179,12 +233,43 @@ class RIPSystem(object):
 
     def is_local(self, host):
         """Determines if an IP address belongs to the local machine."""
-        return host in self.local_addrs
+        for iface in self.logical_ifaces:
+            if host == iface.ip.ip.exploded:
+                return True
+        return False
+
+
+class LinuxPhysicalInterface(object):
+    def __init__(self, name, flags):
+        self.name = name
+        self._flags = flags
+
+    def multicast_enabled(self):
+        return "MULTICAST" in self._flags
+
+    def operational(self):
+        return "UP" in self._flags and "LOWER_UP" in self._flags
+
+    def usable(self):
+        return self.multicast_enabled() and self.operational()
+
+
+class LinuxLogicalInterface(object):
+    def __init__(self, phy_iface, ip, metric=1, activated=False):
+        self.phy_iface = phy_iface
+        self.ip = ipaddr.IPv4Network(ip)
+        self.activated = activated
+        self.metric = metric
+
+    def usable(self):
+        return self.phy_iface.usable()
+
 
 class ModifyRouteError(Exception):
     def __init__(self, operation, output=None):
         self.operation = operation
         self.output = output
+
 
 class RIPPacket(object):
     def __init__(self, data=None, hdr=None, rtes=None):
@@ -200,7 +285,7 @@ class RIPPacket(object):
             raise(ValueError)
 
     def _init_from_net(self, data):
-        """ Init from bytes received on the wire."""
+        """Init from data received from the network."""
         # Quick check for malformed data
         datalen = len(data)
         if datalen < RIPHeader.SIZE:
@@ -227,10 +312,7 @@ class RIPPacket(object):
             rte_end += RIPRouteEntry.SIZE
 
     def _init_from_host(self, hdr, rtes):
-        """
-        Init using a header and rte list read off of the network.
-        This is a terrible name.
-        """
+        """Init using a header and rte list provided by the application."""
         if hdr.ver != 2:
             raise(ValueError)
         self.hdr = hdr
@@ -262,8 +344,8 @@ class RIPHeader(object):
             raise(ValueError)
 
     def _init_from_net(self, rawdata):
-        """Init from data received on the network."""
-        raise(Exception)
+        """Init from data received from the network."""
+        raise(NotImplemented)
 
     def _init_from_host(self, cmd, ver):
         """Init from data provided by the application."""
@@ -297,35 +379,26 @@ class RIPRouteEntry(object):
             raise(TypeError)
 
         # IPv4 only supported
+        self.packed = None
         self.afi = 2
         self.network = ipaddr.IPv4Network(address + "/" + mask)
         self.mask = mask
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
         self.tag = tag
-        self.packed = None
 
     def serialize(self):
         """
         Format into typical RIPv2 header format suitable to be sent
         over the network. This is the updated header from RFC 2453 section 4.
         """
-
-        if self.packed != None:
-            return self.packed
-
-        return struct.pack(self.FORMAT, self.afi, self.tag, self.network.network._ip, self.network.netmask._ip, self.nexthop._ip, self.metric)
-#        self.packed = str()
-#        self.packed += struct.pack(">I", self.afi)
-#        self.packed += struct.pack(">I", self.tag)
-#        self.packed += self.network.network.packed
-#        self.packed += self.network.netmask.packed
-#        self.packed += self.nexthop.packed
-#        self.packed += struct.pack(">I", self.metric)
-
+        if not self.packed:
+            self.packed = struct.pack(self.FORMAT, self.afi, self.tag, self.network.network._ip, self.network.netmask._ip, self.nexthop._ip, self.metric)
         return self.packed
 
     def _init_from_net(self, rawdata):
+        """Init from data received on the network."""
+        self.packed = None
         rte = struct.unpack(self.FORMAT, rawdata)
         self.afi = rte[0]
         zero = rte[1]
@@ -353,11 +426,36 @@ class RIPFactory(protocol.Protocol):
     def doStop(self):
         pass
 
+def parse_args(argv):
+    op = optparse.OptionParser()
+    op.add_option("-p", "--port", default=520, type="int",
+                  help="The port number to use (520)")
+    op.add_option("-i", "--interface", type="str", action="append",
+                  help="An interface IP to use for RIP. "
+                       "Can specify -i multiple times.")
+    op.add_option("-I", "--import-routes", default=False, action="store_true",
+                  help="Import local routes from the kernel upon startup.")
+    op.add_option("-r", "--route", type="str", action="append",
+                  help="A route to import, in CIDR notation. "
+                        "Can specify -r multiple times.")
 
-if __name__ == "__main__":
+    options, arguments = op.parse_args(argv)
+    if not options.interface:
+        op.error("At least one interface IP is required (-i).")
+    return options, arguments
+
+def main(argv):
     # Must run as root to manipulate the routing table.
     userid = subprocess.check_output("id -u".split()).rstrip()
     if userid != "0":
         print("Must run as root. Exiting.")
         sys.exit(1)
-    srv = RIP()
+
+    options, arguments = parse_args(argv)
+
+    ripserv = RIP(options.route, options.import_routes, options.interface)
+    reactor.listenMulticast(520, ripserv)
+    reactor.run()
+
+if __name__ == "__main__":
+    main(sys.argv)
