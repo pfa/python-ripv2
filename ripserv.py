@@ -9,13 +9,18 @@ import optparse
 from twisted.internet import protocol
 from twisted.internet import reactor
 import logging
+import logging.config
+import binascii
 
 class RIP(protocol.DatagramProtocol):
+    """An implementation of RIPv2 using the twisted asynchronous networking
+    framework."""
 
     TYPE_REQUEST = 1
     TYPE_RESPONSE = 2
 
-    def __init__(self, port=520, user_routes=None, importroutes=False, requested_ifaces=None):
+    def __init__(self, port=520, user_routes=None, importroutes=False,
+                 requested_ifaces=None, log_config="logging.conf"):
         """
         port -- The UDP port to listen and send on (default 520).
         user_routes -- A list of routes to advertise.
@@ -23,8 +28,13 @@ class RIP(protocol.DatagramProtocol):
             routes to import into RIP during startup.
         requested_ifaces -- A list of interface names to send updates out of.
             If None, use all interfaces.
+        log_config -- The logging config file (default logging.conf)
         """
-        self._sys = RIPSystem()
+        self.init_logging(log_config)
+        if sys.platform == "linux2":
+            self._sys = LinuxRIPSystem(log_config=log_config)
+        else:
+            raise(NotImplemented("No support for current OS."))
         self.port = port
         self._routes = []
         if user_routes:
@@ -42,7 +52,7 @@ class RIP(protocol.DatagramProtocol):
                                     nexthop=nexthop,
                                     metric=metric,
                                     tag=tag)
-                print("Trying to add user route %s" % rte)
+                self.log.debug("Trying to add user route %s" % rte)
                 self.try_add_route(rte, False)
 
         if importroutes:
@@ -51,15 +61,14 @@ class RIP(protocol.DatagramProtocol):
 
         self.activate_ifaces(requested_ifaces)
 
-        # Use callWhenRunning so update jitter can be introduced later on.
+        # Use callWhenRunning so update jitter can be introduced for
+        # send_update() later on.
         reactor.callWhenRunning(self.send_update)
         reactor.callWhenRunning(self.validate_routes)
 
-    def add_route(self):
-        self._routes
-
-    def del_route(self):
-        pass
+    def init_logging(self, log_config):
+        logging.config.fileConfig(log_config, disable_existing_loggers=True)
+        self.log = logging.getLogger("RIP")
 
     def activate_ifaces(self, requested_ifaces):
         """Enable RIP processing on the given IPs/interfaces.
@@ -70,7 +79,7 @@ class RIP(protocol.DatagramProtocol):
         usable_sys_ifaces = []
         for sys_iface in self._sys.logical_ifaces:
             if sys_iface.usable():
-                logging.warn("Iface %s is usable." % sys_iface.phy_iface.name)
+                self.log.debug("Iface %s is usable." % sys_iface.phy_iface.name)
                 usable_sys_ifaces.append(sys_iface)
 
         for req_iface in requested_ifaces:
@@ -85,13 +94,6 @@ class RIP(protocol.DatagramProtocol):
                       " (Is it assigned to this machine on an interface that "
                       "is 'up'?)" % req_iface))
 
-    def use_iface(self, iface):
-        """Determine if an interface can be used for RIP"""
-        if self.active_ifaces != None:
-            if iface in self.active_ifaces:
-                return True
-        return iface.usable()
-
     def startProtocol(self):
         for iface in self._sys.logical_ifaces:
             if iface.activated == True:
@@ -102,7 +104,7 @@ class RIP(protocol.DatagramProtocol):
         Send an update message across the network.
         XXX -- Does not deal with >25 routes correctly.
         """
-        logging.warn("Sending an update.")
+        self.log.info("Sending an update.")
         msg = RIPHeader(cmd=self.TYPE_RESPONSE, ver=2).serialize()
         for rt in self._routes:
             msg += rt.serialize()
@@ -116,20 +118,24 @@ class RIP(protocol.DatagramProtocol):
 
     def datagramReceived(self, data, (host, port)):
         if port != self.port:
-            print("Advertisement source port was not the RIP port. Ignoring.")
+            self.log.debug("Advertisement source port was not the RIP port. "
+                           "Ignoring.")
             return
 
         if self._sys.is_local(host):
-            logging.warn("Ignoring message from local system.")
+            self.log.debug("Ignoring message from local system.")
             return
 
-        logging.warn("Processing a datagram from host %s." % host)
+        self.log.debug("Processing a datagram from host %s." % host)
 
         try:
-            msg = RIPPacket(data=data)
+            msg = RIPPacket(data=data, src_ip=host)
+            self.log.debug(msg)
         except FormatException:
-            # XXX invalid format -- log this instead
-            logging.warn("Invalid format.")
+            self.log.warn("RIP packet with invalid format received.")
+            self.log.debug("Hex dump:")
+            self.log.debug(binascii.hexlify(data))
+            return
 
         if msg.header.cmd == self.TYPE_REQUEST:
             self.process_request(msg)
@@ -143,12 +149,14 @@ class RIP(protocol.DatagramProtocol):
         pass
 
     def process_response(self, msg):
-        for rte in msg.rtelist():
+        for rte in msg.rtelist:
             rte.metric += 1
             self.try_add_route(rte)
 
     def try_add_route(self, rte, install=True):
-        bestroute = self.get_route(rte.network.exploded, rte.mask)
+        print rte
+        bestroute = self.get_route(rte.network.ip.exploded,
+                                   rte.network.netmask.exploded)
 
         if (bestroute == None) or (rte.metric < bestroute.metric):
             self.uninstall_route(bestroute)
@@ -171,22 +179,23 @@ class RIP(protocol.DatagramProtocol):
         return None
 
 
-class RIPSystem(object):
-    """The interface to the system on which RIP is running."""
+class LinuxRIPSystem(object):
+    """The Linux interface for RIP."""
 
     IP_CMD = "/sbin/ip"
     RT_DEL_ARGS = "route del %(net)s/%(mask)s"
     RT_ADD_ARGS = "route add %(net)s/%(mask)s via %(nh)s metric %(metric)d " \
                   "table %(table)d" 
 
-    def __init__(self, table=52, priority=1000):
+    def __init__(self, table=52, priority=1000, log_config="logging.conf"):
         """
-        Table is the routing table to install routes to (if applicable on
-        the platform RIP is running on).
-
-        Priority is the desirability of the RIP process relative to other
-        routing daemons (if applicable on the platform RIP is running on).
+        table -- the routing table to install routes to (if applicable on
+            the platform RIP is running on).
+        priority -- the desirability of the RIP process relative to other
+            routing daemons (if applicable on the platform RIP is running on).
+        log_config -- The logging configuration file.
         """
+        self.init_logging(log_config)
         if table > 255 or table < 0:
             raise(ValueError)
         if priority > 32767 or priority < 0:
@@ -204,6 +213,10 @@ class RIPSystem(object):
 
         self.update_interface_info()
         self.loopback = "127.0.0.1"
+
+    def init_logging(self, log_config):
+        logging.config.fileConfig(log_config, disable_existing_loggers=True)
+        self.log = logging.getLogger("System")
 
     def update_interface_info(self):
         """Updates self according to the current state of physical and logical
@@ -310,37 +323,34 @@ class ModifyRouteError(Exception):
 
 
 class RIPPacket(object):
-    def __init__(self, data=None, hdr=None, rtes=None):
+    def __init__(self, data=None, hdr=None, rtes=None, src_ip=None):
         """
         Create a RIP packet either from the binary data received from the
         network, or from a RIP header and RTE list.
         """
-        if data:
-            self._init_from_net(data)
+        if data and src_ip:
+            self._init_from_net(data, src_ip)
         elif hdr and rtes:
             self._init_from_host(hdr, rtes)
         else:
             raise(ValueError)
 
     def __repr__(self):
-        return "RIPPacket: Version %d, AFI %d, RTEs." % \
-                (self.header.ver, self.header.afi, len(self.rtelist))
+        return "RIPPacket: Command %d, Version %d, number of RTEs %d." % \
+                (self.header.cmd, self.header.ver, len(self.rtelist))
 
-    def _init_from_net(self, data):
+    def _init_from_net(self, data, src_ip):
         """Init from data received from the network."""
         # Quick check for malformed data
         datalen = len(data)
         if datalen < RIPHeader.SIZE:
-            raise(ValueError)
+            raise(FormatException)
 
         malformed_rtes = (datalen - RIPHeader.SIZE) % RIPRouteEntry.SIZE
         if malformed_rtes != 0:
-            raise(ValueError)
+            raise(FormatException)
 
         numrtes = (datalen - RIPHeader.SIZE) / RIPRouteEntry.SIZE
-        if numrtes == 0:
-            return
-
         self.header = RIPHeader(data[0:RIPHeader.SIZE])
 
         # Route entries
@@ -349,7 +359,8 @@ class RIPPacket(object):
         rte_start = RIPHeader.SIZE
         rte_end = RIPHeader.SIZE + RIPRouteEntry.SIZE
         for i in range(numrtes):
-            self.rtelist.append(RIPRouteEntry(data[rte_start:rte_end]))
+            self.rtelist.append(RIPRouteEntry(rawdata=data[rte_start:rte_end],
+                                              src_ip=src_ip))
             rte_start += RIPRouteEntry.SIZE
             rte_end += RIPRouteEntry.SIZE
 
@@ -390,7 +401,14 @@ class RIPHeader(object):
 
     def _init_from_net(self, rawdata):
         """Init from data received from the network."""
-        raise(NotImplemented)
+        self.packed = None
+        header = struct.unpack(self.FORMAT, rawdata)
+
+        self.cmd = header[0]
+        self.ver = header[1]
+        zero = header[2]
+        if zero != 0:
+            raise(FormatException)
 
     def _init_from_host(self, cmd, ver):
         """Init from data provided by the application."""
@@ -409,32 +427,50 @@ class RIPHeader(object):
 
 
 class RIPRouteEntry(object):
-    FORMAT = ">HhIIII"
+    FORMAT = ">HHIIII"
     SIZE = struct.calcsize(FORMAT)
 
     def __init__(self, rawdata=None, address=None, mask=None, nexthop=None,
-                 metric=None, tag=0):
-        if rawdata != None:
-            self._init_from_net(rawdata)
-            return
-        elif address == None or \
-             mask    == None or \
-             nexthop == None or \
-             metric  == None:
-            raise(TypeError)
-
-        # IPv4 only supported
+                 metric=None, tag=0, src_ip=None):
         self.packed = None
+        if rawdata and src_ip:
+            self._init_from_net(rawdata, src_ip)
+        elif address and \
+             mask    and \
+             nexthop and \
+             metric:
+            self._init_from_host(address, mask, nexthop, metric, tag)
+        else:
+            raise(ValueError)
+
+    def _init_from_host(self, address, mask, nexthop, metric, tag):
+        """Init from data provided by the application."""
+        # IPv4 only supported
         self.afi = 2
         self.network = ipaddr.IPv4Network(address + "/" + mask)
-        self.mask = mask
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
         self.tag = tag
 
+    def _init_from_net(self, rawdata, src_ip):
+        """Init from data received on the network."""
+        self.packed = None
+        rte = struct.unpack(self.FORMAT, rawdata)
+        self.afi = rte[0]
+        self.tag = rte[1]
+        address = ipaddr.IPv4Address(rte[2])
+        mask = ipaddr.IPv4Address(rte[3])
+        self.nexthop = ipaddr.IPv4Address(rte[4])
+        self.metric = rte[5]
+
+        if self.nexthop.exploded == "0.0.0.0":
+            self.nexthop = ipaddr.IPv4Address(src_ip)
+        self.network = ipaddr.IPv4Network(address.exploded + "/" +
+                                          mask.exploded)
+
     def __repr__(self):
         return "RIPRouteEntry(address=%s, mask=%s, nexthop=%s, metric=%d, " \
-               "tag=%d)" % (self.network.ip.exploded, self.mask, self.nexthop, self.metric, self.tag)
+               "tag=%d)" % (self.network.ip.exploded, self.network.netmask.exploded, self.nexthop, self.metric, self.tag)
 
     def serialize(self):
         """
@@ -444,17 +480,6 @@ class RIPRouteEntry(object):
         if not self.packed:
             self.packed = struct.pack(self.FORMAT, self.afi, self.tag, self.network.network._ip, self.network.netmask._ip, self.nexthop._ip, self.metric)
         return self.packed
-
-    def _init_from_net(self, rawdata):
-        """Init from data received on the network."""
-        self.packed = None
-        rte = struct.unpack(self.FORMAT, rawdata)
-        self.afi = rte[0]
-        zero = rte[1]
-        self.tag = rte[2]
-        self.mask = rte[3]
-        self.nexthop = rte[4]
-        self.metric = rte[5]
 
 
 class RIPException(Exception):
@@ -487,24 +512,32 @@ def parse_args(argv):
     op.add_option("-r", "--route", type="str", action="append",
                   help="A route to import, in CIDR notation. "
                         "Can specify -r multiple times.")
+    op.add_option("-l", "--log-config", default="logging.conf",
+                  help="The logging configuration file "
+                        "(default logging.conf).")
 
     options, arguments = op.parse_args(argv)
     if not options.interface:
         op.error("At least one interface IP is required (-i).")
+
+    if len(arguments) > 1:
+        op.error("Unexpected non-option argument(s): '" + \
+                 " ".join(arguments[1:]) + "'") 
+
     return options, arguments
 
 def main(argv):
     # Must run as root to manipulate the routing table.
     userid = subprocess.check_output("id -u".split()).rstrip()
     if userid != "0":
-        print("Must run as root. Exiting.")
+        sys.stderr.write("Must run as root. Exiting.\n")
         sys.exit(1)
 
     options, arguments = parse_args(argv)
 
-    ripserv = RIP(options.port, options.route, options.import_routes, options.interface)
+    ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config)
     reactor.listenMulticast(options.port, ripserv)
     reactor.run()
 
 if __name__ == "__main__":
-    main(sys.argv)
+    sys.exit(main(sys.argv))
