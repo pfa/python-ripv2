@@ -121,7 +121,7 @@ class RIP(protocol.DatagramProtocol):
         Send an update message across the network.
         XXX -- Does not deal with >25 routes correctly.
         """
-        self.log.info("Sending an update.")
+        self.log.debug("Sending an update.")
         msg = RIPHeader(cmd=self.TYPE_RESPONSE, ver=2).serialize()
         for rt in self._routes:
             msg += rt.serialize()
@@ -171,7 +171,6 @@ class RIP(protocol.DatagramProtocol):
             self.try_add_route(rte)
 
     def try_add_route(self, rte, install=True):
-        print rte
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
@@ -191,9 +190,20 @@ class RIP(protocol.DatagramProtocol):
 
     def get_route(self, net, mask):
         for rt in self._routes:
-            if (net == rt.network.exploded) and (mask == rt.mask):
+            if (net == rt.network.ip.exploded) and \
+               (mask == rt.network.netmask.exploded):
                 return rt
         return None
+
+    def cleanup(self):
+        """Clean up any system changes made while running (uninstall
+        routes etc.)."""
+        self.log.info("Cleaning up.")
+        self._sys.uninstall_rule()
+        for rt in self._routes:
+            if rt.nexthop.exploded != "0.0.0.0":
+                self._sys.uninstall_route(rt.network.exploded,
+                                          rt.network.prefixlen)
 
 
 class LinuxRIPSystem(object):
@@ -220,16 +230,25 @@ class LinuxRIPSystem(object):
 
         self.table = table
         self.priority = priority
+        self.install_rule()
+        self.update_interface_info()
+        self.loopback = "127.0.0.1"
 
+    def install_rule(self):
         cmd = [self.IP_CMD] + ("rule add priority %d table %d" % \
-               (priority, table)).split()
+               (self.priority, self.table)).split()
         try:
             output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             raise #(ModifyRouteError("rule_install"))
 
-        self.update_interface_info()
-        self.loopback = "127.0.0.1"
+    def uninstall_rule(self):
+        cmd = [self.IP_CMD] + ("rule del priority %d table %d" % \
+               (self.priority, self.table)).split()
+        try:
+            output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        except subprocess.CalledProcessError:
+            raise #(ModifyRouteError("rule_install"))
 
     def init_logging(self, log_config):
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
@@ -393,11 +412,10 @@ class RIPPacket(object):
         Return a bytestring representing this packet in a form that
         can be transmitted across the network.
         """
-        if self.packed != None:
-            return self.packed
-        self.packed = self.hdr.serialize()
-        for rte in self.rtelist:
-            self.packed += rte.serialize()
+        if not self.packed:
+            self.packed = self.hdr.serialize()
+            for rte in self.rtelist:
+                self.packed += rte.serialize()
         return self.packed
 
 
@@ -406,6 +424,7 @@ class RIPHeader(object):
     SIZE = struct.calcsize(FORMAT)
 
     def __init__(self, rawdata=None, cmd=None, ver=None):
+        self.packed = None
         if cmd and ver:
             self._init_from_host(cmd, ver)
         elif rawdata:
@@ -414,11 +433,10 @@ class RIPHeader(object):
             raise(ValueError)
 
     def __repr__(self):
-        return "RIPHeader(cmd=%d, ver=%d" % (self.cmd, self.ver)
+        return "RIPHeader(cmd=%d, ver=%d)" % (self.cmd, self.ver)
 
     def _init_from_net(self, rawdata):
         """Init from data received from the network."""
-        self.packed = None
         header = struct.unpack(self.FORMAT, rawdata)
 
         self.cmd = header[0]
@@ -440,7 +458,9 @@ class RIPHeader(object):
             self.ver = ver
 
     def serialize(self):
-        return struct.pack(self.FORMAT, self.cmd, self.ver, 0)
+        if not self.packed:
+            self.packed = struct.pack(self.FORMAT, self.cmd, self.ver, 0)
+        return self.packed
 
 
 class RIPRouteEntry(object):
@@ -496,7 +516,10 @@ class RIPRouteEntry(object):
         over the network. This is the updated header from RFC 2453 section 4.
         """
         if not self.packed:
-            self.packed = struct.pack(self.FORMAT, self.afi, self.tag, self.network.network._ip, self.network.netmask._ip, self.nexthop._ip, self.metric)
+            self.packed = struct.pack(self.FORMAT, self.afi, self.tag,
+                                      self.network.network._ip,
+                                      self.network.netmask._ip,
+                                      self.nexthop._ip, self.metric)
         return self.packed
 
 
@@ -517,6 +540,7 @@ class RIPFactory(protocol.Protocol):
 
     def doStop(self):
         pass
+
 
 def parse_args(argv):
     op = optparse.OptionParser()
@@ -555,7 +579,10 @@ def main(argv):
 
     ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config)
     reactor.listenMulticast(options.port, ripserv)
-    reactor.run()
+    try:
+        reactor.run()
+    finally:
+        ripserv.cleanup()
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
