@@ -26,6 +26,9 @@ import optparse
 import binascii
 import logging
 import logging.config
+import random
+import datetime
+import traceback
 from twisted.internet import protocol
 from twisted.internet import reactor
 
@@ -33,8 +36,7 @@ class RIP(protocol.DatagramProtocol):
     """An implementation of RIPv2 using the twisted asynchronous networking
     framework."""
 
-    TYPE_REQUEST = 1
-    TYPE_RESPONSE = 2
+    MAX_ROUTES_PER_UPDATE = 25
 
     def __init__(self, port=520, user_routes=None, importroutes=False,
                  requested_ifaces=None, log_config="logging.conf"):
@@ -48,6 +50,7 @@ class RIP(protocol.DatagramProtocol):
         log_config -- The logging config file (default logging.conf)
         """
         self.init_logging(log_config)
+        self._route_change = False
         if sys.platform == "linux2":
             self._sys = LinuxRIPSystem(log_config=log_config)
         else:
@@ -77,10 +80,12 @@ class RIP(protocol.DatagramProtocol):
                 self.try_add_route(rt, False)
 
         self.activate_ifaces(requested_ifaces)
+        self._last_trigger_time = datetime.datetime.now()
+        self._trigger_suppression_timeout = datetime.timedelta(seconds=0)
 
         # Use callWhenRunning so update jitter can be introduced for
-        # send_update() later on.
-        reactor.callWhenRunning(self.send_update)
+        # generate_update() later on.
+        reactor.callWhenRunning(self.generate_update)
         reactor.callWhenRunning(self.validate_routes)
 
     def init_logging(self, log_config):
@@ -116,22 +121,44 @@ class RIP(protocol.DatagramProtocol):
             if iface.activated == True:
                 self.transport.joinGroup("224.0.0.9", iface.ip.ip.exploded)
 
-    def send_update(self):
-        """
-        Send an update message across the network.
-        XXX -- Does not deal with >25 routes correctly.
-        """
-        self.log.debug("Sending an update.")
-        msg = RIPHeader(cmd=self.TYPE_RESPONSE, ver=2).serialize()
-        for rt in self._routes:
-            msg += rt.serialize()
+    def generate_update(self, triggered=False):
+        """Send an update message across the network."""
+        self.log.debug("Sending an update. Triggered = %d." % triggered)
+        header = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
+        msg = header
 
+        route_count = 0
         for iface in self._sys.logical_ifaces:
-            if iface.activated:
-                self.transport.setOutgoingInterface(iface.ip.ip.exploded)
-                self.transport.write(msg, ("224.0.0.9", self.port))
+            self.log.debug("Preparing update for interface %s" %
+                           iface.phy_iface.name)
+            if not iface.activated:
+                self.log.debug("Interface not activated. Skipping.")
+                continue
+            for rt in self._routes:
+                self.log.debug("Trying to add route to update: %s." % rt)
+                if triggered and not rt.changed:
+                    self.log.debug("Route hasn't changed. Skipping.")
+                    continue
+                if rt.nexthop in iface.ip:
+                    self.log.debug("Split horizon prevents sending route.")
+                    continue
+                self.log.debug("Adding route to update.")
+                msg += rt.serialize()
+                route_count += 1
+                if route_count == self.MAX_ROUTES_PER_UPDATE:
+                    self.send_update_multicast(msg, iface.ip.ip.exploded)
+                    msg = header
+                    route_count = 0
 
-        reactor.callLater(5, self.send_update)
+            if len(msg) > RIPHeader.SIZE:
+                self.send_update_multicast(msg, iface.ip.ip.exploded)
+
+        if not triggered:
+            reactor.callLater(5, self.generate_update)
+
+    def send_update_multicast(self, msg, ip):
+        self.transport.setOutgoingInterface(ip)
+        self.transport.write(msg, ("224.0.0.9", self.port))
 
     def datagramReceived(self, data, (host, port)):
         if port != self.port:
@@ -139,24 +166,36 @@ class RIP(protocol.DatagramProtocol):
                            "Ignoring.")
             return
 
-        if self._sys.is_local(host):
-            self.log.debug("Ignoring message from local system.")
-            return
-
         self.log.debug("Processing a datagram from host %s." % host)
 
+        link_local = False
+        host = ipaddr.IPv4Address(host)
+        for local_iface in self._sys.logical_ifaces:
+            if local_iface.ip.ip.exploded == host.exploded:
+                self.log.debug("Ignoring message from local system.")
+                return
+            elif host in local_iface.ip:
+                link_local = True
+                break
+        if not link_local:
+            self.log.warn("Received advertisement from non link-local "
+                          "host. Ignoring.")
+            return
+
         try:
-            msg = RIPPacket(data=data, src_ip=host)
+            msg = RIPPacket(data=data, src_ip=host.exploded)
             self.log.debug(msg)
         except FormatException:
             self.log.warn("RIP packet with invalid format received.")
             self.log.debug("Hex dump:")
             self.log.debug(binascii.hexlify(data))
+            self.log.debug("Traceback:")
+            self.log.debug(traceback.format_exc())
             return
 
-        if msg.header.cmd == self.TYPE_REQUEST:
+        if msg.header.cmd == RIPHeader.TYPE_REQUEST:
             self.process_request(msg)
-        elif msg.header.cmd == self.TYPE_RESPONSE:
+        elif msg.header.cmd == RIPHeader.TYPE_RESPONSE:
             self.process_response(msg)
 
     def validate_routes(self):
@@ -167,26 +206,67 @@ class RIP(protocol.DatagramProtocol):
 
     def process_response(self, msg):
         for rte in msg.rtelist:
-            rte.metric += 1
+            # XXX Should update to use the metric of the incoming interface
+            rte.metric = min(rte.metric + 1, RIPRouteEntry.MAX_METRIC)
             self.try_add_route(rte)
+
+    # TODO: finish this up
+    def handle_route_change(self):
+        if self._route_change:
+            return
+
+        self._route_change = True
+        current_time = datetime.datetime.now()
+        _triggered_suppression_timeout = \
+                            datetime.timedelta(seconds=random.randrange(1, 5))
+
+        if self._last_trigger_time + self._trigger_suppression_timeout > \
+           current_time:
+            self._send_triggered_update()
+        else:
+            reactor.callLater(self._trigger_suppression_timeout.total_seconds(),
+                              self._send_triggered_update)
+
+    def _send_triggered_update(self):
+        self._route_change = False
+        msg = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
+        for rt in self._routes:
+            if rt.changed:
+                msg += rt.serialize()
+
+        # Don't send empty updates
+        if len(msg) == RIPHeader.SIZE:
+            return
+        
 
     def try_add_route(self, rte, install=True):
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
-        if (bestroute == None) or (rte.metric < bestroute.metric):
-            self.uninstall_route(bestroute)
+        if not bestroute:
             self._routes.append(rte)
             if not install:
                 return
+            self.handle_route_change()
             self._sys.install_route(rte.network.ip.exploded,
                                     rte.network.prefixlen, rte.metric,
                                     rte.nexthop)
-
-    def uninstall_route(self, rt):
-        if rt in self._routes:
-            self._sys.uninstall_route(rt.network.exploded, rt.mask.exploded)
-            self._routes.remove(rt)
+        else:
+            if rte.nexthop == bestroute.nexthop:
+                bestroute.init_timeout()
+                if bestroute.metric != rte.metric:
+                    if bestroute.metric != RIPRouteEntry.MAX_METRIC and \
+                       rte.metric == RIPRouteEntry.MAX_METRIC:
+                        # XXX Start deletion process
+                        pass
+                    if rte.metric != bestroute.metric:
+                        bestroute.metric = rte.metric
+                        self._sys.uninstall_route(bestroute.network.ip.exploded,
+                                               bestroute.network.mask.exploded)
+                        self._sys.install_route(bestroute.network.ip.exploded,
+                                 bestroute.network.prefixlen, bestroute.metric,
+                                 bestroute.nexthop)
+                        self.handle_route_change()
 
     def get_route(self, net, mask):
         for rt in self._routes:
@@ -233,6 +313,7 @@ class LinuxRIPSystem(object):
         self.install_rule()
         self.update_interface_info()
         self.loopback = "127.0.0.1"
+        self._route_change = False
 
     def install_rule(self):
         cmd = [self.IP_CMD] + ("rule add priority %d table %d" % \
@@ -318,7 +399,7 @@ class LinuxRIPSystem(object):
             local_routes.append(rte)
         return local_routes
 
-    def is_local(self, host):
+    def is_self(self, host):
         """Determines if an IP address belongs to the local machine."""
         for iface in self.logical_ifaces:
             if host == iface.ip.ip.exploded:
@@ -422,6 +503,8 @@ class RIPPacket(object):
 class RIPHeader(object):
     FORMAT = ">BBH"
     SIZE = struct.calcsize(FORMAT)
+    TYPE_REQUEST = 1
+    TYPE_RESPONSE = 2
 
     def __init__(self, rawdata=None, cmd=None, ver=None):
         self.packed = None
@@ -466,10 +549,14 @@ class RIPHeader(object):
 class RIPRouteEntry(object):
     FORMAT = ">HHIIII"
     SIZE = struct.calcsize(FORMAT)
+    TIMEOUT = 30
+    MIN_METRIC = 0
+    MAX_METRIC = 16
 
     def __init__(self, rawdata=None, address=None, mask=None, nexthop=None,
                  metric=None, tag=0, src_ip=None):
         self.packed = None
+        self.changed = False
         if rawdata and src_ip:
             self._init_from_net(rawdata, src_ip)
         elif address and \
@@ -489,6 +576,10 @@ class RIPRouteEntry(object):
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
         self.tag = tag
+        self.init_timeout()
+
+    def init_timeout(self):
+        self.timeout = self.TIMEOUT
 
     def _init_from_net(self, rawdata, src_ip):
         """Init from data received on the network."""
@@ -506,9 +597,23 @@ class RIPRouteEntry(object):
         self.network = ipaddr.IPv4Network(address.exploded + "/" +
                                           mask.exploded)
 
+        # Validation
+        if not (self.MIN_METRIC <= self.metric <= self.MAX_METRIC):
+            raise(FormatException)
+
     def __repr__(self):
         return "RIPRouteEntry(address=%s, mask=%s, nexthop=%s, metric=%d, " \
                "tag=%d)" % (self.network.ip.exploded, self.network.netmask.exploded, self.nexthop, self.metric, self.tag)
+
+    def __eq__(self, other):
+        if self.afi     == other.afi      and \
+           self.network == other.network  and \
+           self.nexthop == other.nexthop  and \
+           self.metric  == other.metric   and \
+           self.tag     == other.tag:
+            return True
+        else:
+            return False
 
     def serialize(self):
         """
