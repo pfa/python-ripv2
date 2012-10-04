@@ -81,7 +81,6 @@ class RIP(protocol.DatagramProtocol):
 
         self.activate_ifaces(requested_ifaces)
         self._last_trigger_time = datetime.datetime.now()
-        self._trigger_suppression_timeout = datetime.timedelta(seconds=0)
 
         # Use callWhenRunning so update jitter can be introduced for
         # generate_update() later on.
@@ -128,17 +127,17 @@ class RIP(protocol.DatagramProtocol):
         msg = header
 
         route_count = 0
-        for iface in self._sys.logical_ifaces:
+        for iface in self.get_active_ifaces():
             self.log.debug("Preparing update for interface %s" %
                            iface.phy_iface.name)
-            if not iface.activated:
-                self.log.debug("Interface not activated. Skipping.")
-                continue
             for rt in self._routes:
                 self.log.debug("Trying to add route to update: %s." % rt)
-                if triggered and not rt.changed:
-                    self.log.debug("Route hasn't changed. Skipping.")
-                    continue
+                if triggered:
+                    if rt.changed:
+                        rt.changed = False
+                    else:
+                        self.log.debug("Route hasn't changed. Skipping.")
+                        continue
                 if rt.nexthop in iface.ip:
                     self.log.debug("Split horizon prevents sending route.")
                     continue
@@ -146,6 +145,8 @@ class RIP(protocol.DatagramProtocol):
                 msg += rt.serialize()
                 route_count += 1
                 if route_count == self.MAX_ROUTES_PER_UPDATE:
+                    self.log.debug("Max routes per update reached."
+                                   " Sending an update...")
                     self.send_update_multicast(msg, iface.ip.ip.exploded)
                     msg = header
                     route_count = 0
@@ -155,6 +156,12 @@ class RIP(protocol.DatagramProtocol):
 
         if not triggered:
             reactor.callLater(5, self.generate_update)
+
+    def get_active_ifaces(self):
+        """Return active logical interfaces."""
+        for iface in self._sys.logical_ifaces:
+            if iface.activated:
+                yield iface
 
     def send_update_multicast(self, msg, ip):
         self.transport.setOutgoingInterface(ip)
@@ -210,7 +217,6 @@ class RIP(protocol.DatagramProtocol):
             rte.metric = min(rte.metric + 1, RIPRouteEntry.MAX_METRIC)
             self.try_add_route(rte)
 
-    # TODO: finish this up
     def handle_route_change(self):
         if self._route_change:
             return
@@ -220,30 +226,24 @@ class RIP(protocol.DatagramProtocol):
         _triggered_suppression_timeout = \
                             datetime.timedelta(seconds=random.randrange(1, 5))
 
-        if self._last_trigger_time + self._trigger_suppression_timeout > \
+        if self._last_trigger_time + _trigger_suppression_timeout > \
            current_time:
             self._send_triggered_update()
         else:
-            reactor.callLater(self._trigger_suppression_timeout.total_seconds(),
+            reactor.callLater(_trigger_suppression_timeout.total_seconds(),
                               self._send_triggered_update)
 
     def _send_triggered_update(self):
+        self.log.debug("Sending triggered update.")
         self._route_change = False
-        msg = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
-        for rt in self._routes:
-            if rt.changed:
-                msg += rt.serialize()
-
-        # Don't send empty updates
-        if len(msg) == RIPHeader.SIZE:
-            return
-        
+        self.generate_update(triggered=True)
 
     def try_add_route(self, rte, install=True):
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
         if not bestroute:
+            rte.changed = True
             self._routes.append(rte)
             if not install:
                 return
@@ -258,11 +258,13 @@ class RIP(protocol.DatagramProtocol):
                     if bestroute.metric != RIPRouteEntry.MAX_METRIC and \
                        rte.metric == RIPRouteEntry.MAX_METRIC:
                         # XXX Start deletion process
+                        # XXX Set change flag?
                         pass
                     if rte.metric != bestroute.metric:
+                        bestroute.changed = True
                         bestroute.metric = rte.metric
                         self._sys.uninstall_route(bestroute.network.ip.exploded,
-                                               bestroute.network.mask.exploded)
+                                               bestroute.network.prefixlen)
                         self._sys.install_route(bestroute.network.ip.exploded,
                                  bestroute.network.prefixlen, bestroute.metric,
                                  bestroute.nexthop)
@@ -282,7 +284,7 @@ class RIP(protocol.DatagramProtocol):
         self._sys.uninstall_rule()
         for rt in self._routes:
             if rt.nexthop.exploded != "0.0.0.0":
-                self._sys.uninstall_route(rt.network.exploded,
+                self._sys.uninstall_route(rt.network.ip.exploded,
                                           rt.network.prefixlen)
 
 
