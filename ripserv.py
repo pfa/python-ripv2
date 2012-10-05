@@ -37,6 +37,10 @@ class RIP(protocol.DatagramProtocol):
     framework."""
 
     MAX_ROUTES_PER_UPDATE = 25
+    UPDATE_TIMER = 5
+    JITTER_VALUE = 2
+    TIMEOUT_TIMER = UPDATE_TIMER * 6
+    GARBAGE_TIMER = UPDATE_TIMER * 4
 
     def __init__(self, port=520, user_routes=None, importroutes=False,
                  requested_ifaces=None, log_config="logging.conf"):
@@ -57,6 +61,7 @@ class RIP(protocol.DatagramProtocol):
             raise(NotImplemented("No support for current OS."))
         self.port = port
         self._routes = []
+        self._garbage_routes = []
         if user_routes:
             metric = 0
             tag = 0
@@ -86,6 +91,30 @@ class RIP(protocol.DatagramProtocol):
         # generate_update() later on.
         reactor.callWhenRunning(self.generate_update)
         reactor.callWhenRunning(self.validate_routes)
+
+    def _start_garbage_collection(self, rt):
+        rt.changed = True
+        rt.metric = RIPRouteEntry.MAX_METRIC
+        self._sys.modify_route(rt)
+        self.add_garbage_route(rt)
+        self.handle_route_change()
+
+    def _remove_garbage_route(self, rt):
+        """Removes a route from garbage collection. Happens if a new path
+        is received to this route before the garbage collection timer
+        expires."""
+        
+
+    def add_garbage_route(self, rt):
+        self._garbage_routes.append(rt)
+        rt.changed = True
+        rt.metric = RIPRouteEntry.MAX_METRIC
+        self._sys.modify_route(rt)
+        self.handle_route_change()
+
+    def collect_garbage_routes(self):
+        rt.init_garbage_timer()
+        
 
     def init_logging(self, log_config):
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
@@ -155,7 +184,14 @@ class RIP(protocol.DatagramProtocol):
                 self.send_update_multicast(msg, iface.ip.ip.exploded)
 
         if not triggered:
-            reactor.callLater(5, self.generate_update)
+            reactor.callLater(self.get_update_interval(), self.generate_update)
+
+    def get_update_interval(self):
+        """Get the amount of time until the next update. This is equal to
+        the default update timer +/- a number of a seconds to create update
+        jitter."""
+        return self.UPDATE_TIMER + random.randrange(-self.JITTER_VALUE,
+                                                     self.JITTER_VALUE)
 
     def get_active_ifaces(self):
         """Return active logical interfaces."""
@@ -223,7 +259,7 @@ class RIP(protocol.DatagramProtocol):
 
         self._route_change = True
         current_time = datetime.datetime.now()
-        _triggered_suppression_timeout = \
+        _trigger_suppression_timeout = \
                             datetime.timedelta(seconds=random.randrange(1, 5))
 
         if self._last_trigger_time + _trigger_suppression_timeout > \
@@ -253,22 +289,26 @@ class RIP(protocol.DatagramProtocol):
                                     rte.nexthop)
         else:
             if rte.nexthop == bestroute.nexthop:
-                bestroute.init_timeout()
                 if bestroute.metric != rte.metric:
                     if bestroute.metric != RIPRouteEntry.MAX_METRIC and \
                        rte.metric == RIPRouteEntry.MAX_METRIC:
                         # XXX Start deletion process
                         # XXX Set change flag?
                         pass
-                    if rte.metric != bestroute.metric:
-                        bestroute.changed = True
-                        bestroute.metric = rte.metric
-                        self._sys.uninstall_route(bestroute.network.ip.exploded,
-                                               bestroute.network.prefixlen)
-                        self._sys.install_route(bestroute.network.ip.exploded,
-                                 bestroute.network.prefixlen, bestroute.metric,
-                                 bestroute.nexthop)
-                        self.handle_route_change()
+                    elif rte.metric != bestroute.metric:
+                        self.update_route(bestroute, rte)
+            elif rte.metric < bestroute.metric:
+                self.log.debug("Found better route to %s via %s in %d", \
+                               (rte.network.exploded, rte.nexthop, rte.metric))
+                self.update_route(bestroute, rte)
+
+    def update_route(self, oldrt, newrt):
+        oldrt.init_timeout()
+        oldrt.changed = True
+        oldrt.metric = newrt.metric
+        oldrt.nexthop = newrt.nexthop
+        self._sys.modify_route(oldrt)
+        self.handle_route_change()
 
     def get_route(self, net, mask):
         for rt in self._routes:
@@ -281,14 +321,91 @@ class RIP(protocol.DatagramProtocol):
         """Clean up any system changes made while running (uninstall
         routes etc.)."""
         self.log.info("Cleaning up.")
-        self._sys.uninstall_rule()
+        self._sys.cleanup()
         for rt in self._routes:
             if rt.nexthop.exploded != "0.0.0.0":
                 self._sys.uninstall_route(rt.network.ip.exploded,
                                           rt.network.prefixlen)
 
 
-class LinuxRIPSystem(object):
+class _RIPSystem(object):
+    """Abstract class for OS-specific functions needed by RIP. These are all
+    the OS-specific methods that need to be overridden by a subclass in order
+    to make RIP functional on a different OS (e.g. Windows)."""
+
+    def init_logging(self, log_config):
+        logging.config.fileConfig(log_config, disable_existing_loggers=True)
+        self.log = logging.getLogger("System")
+        self.phy_ifaces = []
+        self.logical_ifaces = []
+
+    def __init__(self, *args, **kwargs):
+        """Args:
+        log_config -- The logging configuration file.
+        """
+        kwargs.setdefault("log_config", "logging.conf")
+        self.init_logging(kwargs["log_config"])
+
+    def modify_route(self, rt):
+        """Update the system routing table to use a new metric and nexthop
+        for the given prefix.
+
+        Since only one path to a prefix should be in the system routing table,
+        a minimum implementation of this function would consist of a call to
+        self.uninstall_route(rt) followed by a call to self.install_route(rt).
+        If the OS support modifying routes (both Windows and Linux do) without
+        using a delete followed by an add, that could also be used.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def cleanup(self):
+        """Clean up the system. Called when exiting.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def update_interface_info(self):
+        """Updates self according to the current state of physical and logical
+        IP interfaces on the device.
+
+        Sets self.phy_ifaces and self.logical_ifaces to be lists of
+        physical interfaces and logical interfaces, respectively. See
+        LinuxPhysicalInterface and LinuxLogicalInterface classes for examples.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def uninstall_route(self, net, mask):
+        """Uninstall a route from the system routing table.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def install_route(self, net, preflen, metric, nexthop):
+        """Install a route in the system routing table.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def get_local_routes(self):
+        """Retrieves routes from the system routing table.
+
+        Return value is a list of RIPRouteEntry objects defining local routes.
+
+        Override in subclass."""
+        raise(NotImplemented)
+
+    def is_self(self, host):
+        """Determines if an IP address belongs to the local machine.
+
+        Returns True if so, otherwise returns False.
+
+        Override in subclass."""
+
+        raise(NotImplemented)
+
+class LinuxRIPSystem(_RIPSystem):
     """The Linux interface for RIP."""
 
     IP_CMD = "/sbin/ip"
@@ -296,28 +413,37 @@ class LinuxRIPSystem(object):
     RT_ADD_ARGS = "route add %(net)s/%(mask)s via %(nh)s metric %(metric)d " \
                   "table %(table)d" 
 
-    def __init__(self, table=52, priority=1000, log_config="logging.conf"):
-        """
+    def __init__(self, *args, **kwargs):
+        """Args:
         table -- the routing table to install routes to (if applicable on
             the platform RIP is running on).
         priority -- the desirability of the RIP process relative to other
             routing daemons (if applicable on the platform RIP is running on).
-        log_config -- The logging configuration file.
         """
-        self.init_logging(log_config)
-        if table > 255 or table < 0:
+        _RIPSystem(self, *args, **kwargs)
+        kwargs.setdefault("table", 52)
+        kwargs.setdefault("priority", 1000)
+
+        self.table = kwargs["table"]
+        self.priority = kwargs["priority"]
+
+        if self.table > 255 or self.table < 0:
             raise(ValueError)
-        if priority > 32767 or priority < 0:
+        if self.priority > 32767 or self.priority < 0:
             raise(ValueError)
 
-        self.table = table
-        self.priority = priority
-        self.install_rule()
+        self._install_rule()
         self.update_interface_info()
         self.loopback = "127.0.0.1"
         self._route_change = False
 
-    def install_rule(self):
+    def modify_route(self, rt):
+        """Update the metric and nexthop address to a prefix."""
+        self.uninstall_route(rt.network.ip.exploded, rt.network.prefixlen)
+        self.install_route(rt.network.ip.exploded, rt.network.prefixlen,
+                           rt.metric, rt.nexthop)
+
+    def _install_rule(self):
         cmd = [self.IP_CMD] + ("rule add priority %d table %d" % \
                (self.priority, self.table)).split()
         try:
@@ -325,17 +451,13 @@ class LinuxRIPSystem(object):
         except subprocess.CalledProcessError:
             raise #(ModifyRouteError("rule_install"))
 
-    def uninstall_rule(self):
+    def _uninstall_rule(self):
         cmd = [self.IP_CMD] + ("rule del priority %d table %d" % \
                (self.priority, self.table)).split()
         try:
             output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             raise #(ModifyRouteError("rule_install"))
-
-    def init_logging(self, log_config):
-        logging.config.fileConfig(log_config, disable_existing_loggers=True)
-        self.log = logging.getLogger("System")
 
     def update_interface_info(self):
         """Updates self according to the current state of physical and logical
@@ -400,6 +522,10 @@ class LinuxRIPSystem(object):
                                 tag=tag)
             local_routes.append(rte)
         return local_routes
+
+    def cleanup(self):
+        """Perform any necessary system cleanup."""
+        self._uninstall_rule()
 
     def is_self(self, host):
         """Determines if an IP address belongs to the local machine."""
@@ -551,7 +677,6 @@ class RIPHeader(object):
 class RIPRouteEntry(object):
     FORMAT = ">HHIIII"
     SIZE = struct.calcsize(FORMAT)
-    TIMEOUT = 30
     MIN_METRIC = 0
     MAX_METRIC = 16
 
@@ -580,8 +705,11 @@ class RIPRouteEntry(object):
         self.tag = tag
         self.init_timeout()
 
+    def init_garbage_timer(self):
+        self.garbage_timer = datetime.datetime.now()
+
     def init_timeout(self):
-        self.timeout = self.TIMEOUT
+        self.timeout = datetime.datetime.now()
 
     def _init_from_net(self, rawdata, src_ip):
         """Init from data received on the network."""
