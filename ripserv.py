@@ -156,17 +156,19 @@ class RIP(protocol.DatagramProtocol):
         msg = header
 
         route_count = 0
+
+        if triggered:
+            routes_to_send = [ rt for rt in self._routes if rt.changed ]
+            for rt in self._routes:
+                rt.changed = False
+        else:
+            routes_to_send = self._routes
+
         for iface in self.get_active_ifaces():
             self.log.debug("Preparing update for interface %s" %
                            iface.phy_iface.name)
-            for rt in self._routes:
+            for rt in routes_to_send:
                 self.log.debug("Trying to add route to update: %s." % rt)
-                if triggered:
-                    if rt.changed:
-                        rt.changed = False
-                    else:
-                        self.log.debug("Route hasn't changed. Skipping.")
-                        continue
                 if rt.nexthop in iface.ip:
                     self.log.debug("Split horizon prevents sending route.")
                     continue
@@ -420,7 +422,7 @@ class LinuxRIPSystem(_RIPSystem):
         priority -- the desirability of the RIP process relative to other
             routing daemons (if applicable on the platform RIP is running on).
         """
-        _RIPSystem(self, *args, **kwargs)
+        super(_RIPSystem, self).__thisclass__..__init__(self, *args, **kwargs)
         kwargs.setdefault("table", 52)
         kwargs.setdefault("priority", 1000)
 
