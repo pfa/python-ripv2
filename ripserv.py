@@ -32,27 +32,27 @@ import traceback
 from twisted.internet import protocol
 from twisted.internet import reactor
 
+import ripadmin
+
 class RIP(protocol.DatagramProtocol):
     """An implementation of RIPv2 using the twisted asynchronous networking
     framework."""
 
     MAX_ROUTES_PER_UPDATE = 25
-    UPDATE_TIMER = 5
+    UPDATE_TIMER = 30
     JITTER_VALUE = 2
     TIMEOUT_TIMER = UPDATE_TIMER * 6
     GARBAGE_TIMER = UPDATE_TIMER * 4
 
     def __init__(self, port=520, user_routes=None, importroutes=False,
                  requested_ifaces=None, log_config="logging.conf"):
-        """
-        port -- The UDP port to listen and send on (default 520).
+        """port -- The UDP port to listen and send on (default 520).
         user_routes -- A list of routes to advertise.
         importroutes -- If True, look in the main kernel routing table for
             routes to import into RIP during startup.
         requested_ifaces -- A list of interface names to send updates out of.
             If None, use all interfaces.
-        log_config -- The logging config file (default logging.conf)
-        """
+        log_config -- The logging config file (default logging.conf)"""
         self.init_logging(log_config)
         self._route_change = False
         if sys.platform == "linux2":
@@ -86,6 +86,10 @@ class RIP(protocol.DatagramProtocol):
 
         self.activate_ifaces(requested_ifaces)
         self._last_trigger_time = datetime.datetime.now()
+
+        #self.admin = ripadmin.RIPAdmin(self)
+        # Setup admin interface
+        ripadmin.start(self)
 
         # Use callWhenRunning so update jitter can be introduced for
         # generate_update() later on.
@@ -155,25 +159,20 @@ class RIP(protocol.DatagramProtocol):
         header = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
         msg = header
 
-        route_count = 0
-
-        if triggered:
-            routes_to_send = [ rt for rt in self._routes if rt.changed ]
-            for rt in self._routes:
-                rt.changed = False
-        else:
-            routes_to_send = self._routes
-
         for iface in self.get_active_ifaces():
             self.log.debug("Preparing update for interface %s" %
                            iface.phy_iface.name)
-            for rt in routes_to_send:
+            route_count = 0
+            for rt in self._routes:
                 self.log.debug("Trying to add route to update: %s." % rt)
                 if rt.nexthop in iface.ip:
                     self.log.debug("Split horizon prevents sending route.")
                     continue
-                self.log.debug("Adding route to update.")
+                if triggered and not rt.changed:
+                    self.log.debug("Route not changed. Skipping.")
+                    continue
                 msg += rt.serialize()
+                self.log.debug("Adding route to update.")
                 route_count += 1
                 if route_count == self.MAX_ROUTES_PER_UPDATE:
                     self.log.debug("Max routes per update reached."
@@ -185,7 +184,10 @@ class RIP(protocol.DatagramProtocol):
             if len(msg) > RIPHeader.SIZE:
                 self.send_update_multicast(msg, iface.ip.ip.exploded)
 
-        if not triggered:
+        if triggered:
+            for rt in self._routes:
+                rt.changed = False
+        else:
             reactor.callLater(self.get_update_interval(), self.generate_update)
 
     def get_update_interval(self):
@@ -277,12 +279,14 @@ class RIP(protocol.DatagramProtocol):
         self.generate_update(triggered=True)
 
     def try_add_route(self, rte, install=True):
+        self.log.debug("try_add_route: Received %s" % rte)
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
         if not bestroute:
             rte.changed = True
             self._routes.append(rte)
+
             if not install:
                 return
             self.handle_route_change()
@@ -322,6 +326,7 @@ class RIP(protocol.DatagramProtocol):
     def cleanup(self):
         """Clean up any system changes made while running (uninstall
         routes etc.)."""
+        # XXX This should probably all be part of _sys.
         self.log.info("Cleaning up.")
         self._sys.cleanup()
         for rt in self._routes:
@@ -343,8 +348,7 @@ class _RIPSystem(object):
 
     def __init__(self, *args, **kwargs):
         """Args:
-        log_config -- The logging configuration file.
-        """
+        log_config -- The logging configuration file."""
         kwargs.setdefault("log_config", "logging.conf")
         self.init_logging(kwargs["log_config"])
 
@@ -419,10 +423,10 @@ class LinuxRIPSystem(_RIPSystem):
         """Args:
         table -- the routing table to install routes to (if applicable on
             the platform RIP is running on).
-        priority -- the desirability of the RIP process relative to other
-            routing daemons (if applicable on the platform RIP is running on).
-        """
-        super(_RIPSystem, self).__thisclass__..__init__(self, *args, **kwargs)
+        priority -- the desirability of routes learned by the RIP process
+            relative to other routing daemons (if applicable on the platform
+            RIP is running on)."""
+        super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
         kwargs.setdefault("table", 52)
         kwargs.setdefault("priority", 1000)
 
@@ -571,10 +575,8 @@ class ModifyRouteError(Exception):
 
 class RIPPacket(object):
     def __init__(self, data=None, hdr=None, rtes=None, src_ip=None):
-        """
-        Create a RIP packet either from the binary data received from the
-        network, or from a RIP header and RTE list.
-        """
+        """Create a RIP packet either from the binary data received from the
+        network, or from a RIP header and RTE list."""
         if data and src_ip:
             self._init_from_net(data, src_ip)
         elif hdr and rtes:
@@ -619,10 +621,8 @@ class RIPPacket(object):
         self.rtelist = rtes
 
     def serialize(self):
-        """
-        Return a bytestring representing this packet in a form that
-        can be transmitted across the network.
-        """
+        """Return a bytestring representing this packet in a form that
+        can be transmitted across the network."""
         if not self.packed:
             self.packed = self.hdr.serialize()
             for rte in self.rtelist:
@@ -748,10 +748,9 @@ class RIPRouteEntry(object):
             return False
 
     def serialize(self):
-        """
-        Format into typical RIPv2 header format suitable to be sent
-        over the network. This is the updated header from RFC 2453 section 4.
-        """
+        """Format into typical RIPv2 header format suitable to be sent
+        over the network. This is the updated header from RFC 2453
+        section 4."""
         if not self.packed:
             self.packed = struct.pack(self.FORMAT, self.afi, self.tag,
                                       self.network.network._ip,
