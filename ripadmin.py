@@ -12,7 +12,7 @@ class RIPAdminProtocol(LineReceiver):
     """Network accessible administrative interface for the RIPAdminCLI."""
 
     def __init__(self, ripinstance, prompt, *args, **kwargs):
-        # Protocol doesn't inherit from object and doesn't implement
+        # Parent doesn't inherit from object and doesn't implement
         # __init__. No parent init to call.
         self.ripinstance = ripinstance
         self.prompt = prompt
@@ -119,7 +119,7 @@ class RIPAdminCLI(Cmd):
 #        remotely without authentication, and this can execute system commands
 #        (e.g. rm...), this is an eminently bad idea unless you're on a
 #        machine in a trusted environment.  That's why this is commented
-#        out by default. However, it can be extremely useful as an adhoc
+#        out by default. However, it can be extremely useful as an ad hoc
 #        debugging tool."""
 #        try:
 #            self.stdout.write(pprint.pformat(eval(line)) + "\n")
@@ -137,11 +137,6 @@ class RIPAdminCLI(Cmd):
                               (inspect.stack()[1][3]))) + "\n")
         except AttributeError:
             self.stdout.write("No usage available.\n")
-
-    def do_debug_level(self, line):
-        """Set the debug level. Usage: debug_level <LEVEL>.
-        LEVEL can be: DEBUG, INFO, WARNING, ERROR, CRITICAL
-        """
 
     def sendline(self, line):
         self.stdout.write(str(line) + "\n")

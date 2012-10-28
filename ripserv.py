@@ -55,6 +55,7 @@ class RIP(protocol.DatagramProtocol):
         log_config -- The logging config file (default logging.conf)"""
         self.init_logging(log_config)
         self._route_change = False
+        self._gc_started = False
         if sys.platform == "linux2":
             self._sys = LinuxRIPSystem(log_config=log_config)
         else:
@@ -76,7 +77,8 @@ class RIP(protocol.DatagramProtocol):
                                     mask=parsed_rt.netmask.exploded,
                                     nexthop=nexthop,
                                     metric=metric,
-                                    tag=tag)
+                                    tag=tag,
+                                    imported=True)
                 self.log.debug("Trying to add user route %s" % rte)
                 self.try_add_route(rte, False)
 
@@ -87,38 +89,78 @@ class RIP(protocol.DatagramProtocol):
         self.activate_ifaces(requested_ifaces)
         self._last_trigger_time = datetime.datetime.now()
 
-        #self.admin = ripadmin.RIPAdmin(self)
         # Setup admin interface
         ripadmin.start(self)
 
-        # Use callWhenRunning so update jitter can be introduced for
-        # generate_update() later on.
         reactor.callWhenRunning(self.generate_update)
-        reactor.callWhenRunning(self.validate_routes)
+        reactor.callWhenRunning(self._check_route_timeouts)
 
     def _start_garbage_collection(self, rt):
+        self.log.debug("Starting garbage collection for route %s" % rt)
         rt.changed = True
-        rt.metric = RIPRouteEntry.MAX_METRIC
-        self._sys.modify_route(rt)
-        self.add_garbage_route(rt)
-        self.handle_route_change()
-
-    def _remove_garbage_route(self, rt):
-        """Removes a route from garbage collection. Happens if a new path
-        is received to this route before the garbage collection timer
-        expires."""
-        
-
-    def add_garbage_route(self, rt):
-        self._garbage_routes.append(rt)
-        rt.changed = True
+        rt.garbage = True
+        rt.init_timeout()
         rt.metric = RIPRouteEntry.MAX_METRIC
         self._sys.modify_route(rt)
         self.handle_route_change()
+        self._init_garbage_collection_timer()
 
-    def collect_garbage_routes(self):
-        rt.init_garbage_timer()
-        
+    def _check_route_timeouts(self):
+        self.log.debug("Checking route timeouts...")
+        now = datetime.datetime.now()
+        begin_invalid_time = now - datetime.timedelta(seconds=self.TIMEOUT_TIMER)
+        timeout_val = datetime.timedelta(seconds=self.TIMEOUT_TIMER)
+        lowest_timer = timeout_val
+
+        for rt in self._routes:
+            if not rt.garbage:
+                if rt.timeout == None:
+                    continue
+                if rt.timeout < begin_invalid_time:
+                    self.log.debug("Adding route to GC: %s" % rt)
+                    self._start_garbage_collection(rt)
+                else:
+                    current_timer = (rt.timeout + timeout_val) - now
+                    lowest_timer = min(lowest_timer,
+                                        current_timer)
+
+        next_call_time = lowest_timer.total_seconds() + 1
+        self.log.debug("Checking timeouts again in %d second(s)" %
+                       next_call_time)
+        reactor.callLater(next_call_time, self._check_route_timeouts)
+
+    def _init_garbage_collection_timer(self):
+        if self._gc_started:
+            return
+        reactor.callLater(self.GARBAGE_TIMER, self._collect_garbage_routes)
+
+    def _collect_garbage_routes(self):
+        self.log.debug("Collecting garbage routes...")
+        now = datetime.datetime.now()
+        flush_before = now - datetime.timedelta(seconds=self.GARBAGE_TIMER)
+        max_wait_time = self.GARBAGE_TIMER + 1
+        lowest_route_timer = max_wait_time
+
+        for rt in self._routes:
+            if rt.garbage:
+                if rt.timeout == None:
+                    continue
+                if rt.timeout < flush_before:
+                    self.log.debug("Deleting route: %s" % rt)
+                    self._sys.uninstall_route(rt.network.ip.exploded,
+                                              rt.network.prefixlen)
+                    self._routes.remove(rt)
+                else:
+                    lowest_route_timer = min(rt.timeout, lowest_route_timer)
+
+        if lowest_route_timer == max_wait_time:
+            self.log.debug("No more routes on GC.")
+            self._gc_started = False
+        else:
+            next_call_time = (now - lowest_route_timer).total_seconds() + 1
+            self.log.debug("Collecting garbage routes again in %d seconds" %
+                           next_call_time)
+            reactor.callLater(next_call_time, self._collect_garbage_routes)
 
     def init_logging(self, log_config):
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
@@ -245,9 +287,6 @@ class RIP(protocol.DatagramProtocol):
         elif msg.header.cmd == RIPHeader.TYPE_RESPONSE:
             self.process_response(msg)
 
-    def validate_routes(self):
-        pass
-
     def process_request(self, msg):
         pass
 
@@ -263,14 +302,14 @@ class RIP(protocol.DatagramProtocol):
 
         self._route_change = True
         current_time = datetime.datetime.now()
-        _trigger_suppression_timeout = \
+        trigger_suppression_timeout = \
                             datetime.timedelta(seconds=random.randrange(1, 5))
 
-        if self._last_trigger_time + _trigger_suppression_timeout > \
+        if self._last_trigger_time + trigger_suppression_timeout > \
            current_time:
             self._send_triggered_update()
         else:
-            reactor.callLater(_trigger_suppression_timeout.total_seconds(),
+            reactor.callLater(trigger_suppression_timeout.total_seconds(),
                               self._send_triggered_update)
 
     def _send_triggered_update(self):
@@ -297,10 +336,8 @@ class RIP(protocol.DatagramProtocol):
             if rte.nexthop == bestroute.nexthop:
                 if bestroute.metric != rte.metric:
                     if bestroute.metric != RIPRouteEntry.MAX_METRIC and \
-                       rte.metric == RIPRouteEntry.MAX_METRIC:
-                        # XXX Start deletion process
-                        # XXX Set change flag?
-                        pass
+                       rte.metric >= RIPRouteEntry.MAX_METRIC:
+                        self._start_garbage_collection(rte)
                     elif rte.metric != bestroute.metric:
                         self.update_route(bestroute, rte)
             elif rte.metric < bestroute.metric:
@@ -310,6 +347,7 @@ class RIP(protocol.DatagramProtocol):
 
     def update_route(self, oldrt, newrt):
         oldrt.init_timeout()
+        oldrt.garbage = False
         oldrt.changed = True
         oldrt.metric = newrt.metric
         oldrt.nexthop = newrt.nexthop
@@ -525,7 +563,8 @@ class LinuxRIPSystem(_RIPSystem):
                                 mask=parsed_network.netmask.exploded,
                                 nexthop=nexthop,
                                 metric=metric,
-                                tag=tag)
+                                tag=tag,
+                                imported=True)
             local_routes.append(rte)
         return local_routes
 
@@ -683,9 +722,12 @@ class RIPRouteEntry(object):
     MAX_METRIC = 16
 
     def __init__(self, rawdata=None, address=None, mask=None, nexthop=None,
-                 metric=None, tag=0, src_ip=None):
+                 metric=None, tag=0, src_ip=None, imported=False):
         self.packed = None
         self.changed = False
+        self.imported = imported
+        self.init_timeout()
+        self.garbage = False
         if rawdata and src_ip:
             self._init_from_net(rawdata, src_ip)
         elif address and \
@@ -705,13 +747,15 @@ class RIPRouteEntry(object):
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
         self.tag = tag
-        self.init_timeout()
-
-    def init_garbage_timer(self):
-        self.garbage_timer = datetime.datetime.now()
 
     def init_timeout(self):
-        self.timeout = datetime.datetime.now()
+        """Sets a timer to the current time. The timer is used as either the
+        "timeout" timer, or the garbage collection timer depending on whether
+        or not self.garbage is set."""
+        if self.imported:
+            self.timeout = None
+        else:
+            self.timeout = datetime.datetime.now()
 
     def _init_from_net(self, rawdata, src_ip):
         """Init from data received on the network."""
