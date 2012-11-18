@@ -26,12 +26,20 @@ def main(argv):
     sock = socket.socket(type=socket.SOCK_DGRAM)
     sock.connect((options.dst, 520))
     sock.send(request.serialize())
-    sock.settimeout(5)
+    wait_time = 5
+    sock.settimeout(wait_time)
+
+    if not options.quiet:
+        print("Sent request. Waiting %d second(s) for response." % wait_time)
 
     # Read response
-    # XXX Doesn't currently deal with >25 routes.
+    # Assumes the full response comes in a single datagram and that the size
+    # doesn't exceed what we attempt to receive.
+    # Note: a receive size of >1500 bytes does make sense since you may connect
+    # to a local rip daemon.
+    buf = ""
     try:
-        buf = sock.recv(1024)
+        buf = sock.recv(65535)
     except socket.timeout:
         print("Did not receive a response from remote router.")
         return -1
@@ -154,8 +162,8 @@ def parse_args(argv):
     if options.specific_routes:
         if not options.route:
             op.error("At least one route to request is required (-r).")
-        if len(options.route) > 25:
-            op.error("Only <25 routes supported currently.")
+#        if len(options.route) > 25:
+#            op.error("Only <25 routes supported currently.")
     if options.whole_table:
         if options.route:
             op.error("No -r arguments are needed if -w is specified.")

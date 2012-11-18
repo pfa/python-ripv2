@@ -31,6 +31,8 @@ import datetime
 import traceback
 from twisted.internet import protocol
 from twisted.internet import reactor
+from twisted.python import log
+import twisted.python.failure
 
 import ripadmin
 
@@ -39,21 +41,34 @@ class RIP(protocol.DatagramProtocol):
     framework."""
 
     MAX_ROUTES_PER_UPDATE = 25
-    UPDATE_TIMER = 30
     JITTER_VALUE = 2
-    TIMEOUT_TIMER = UPDATE_TIMER * 6
-    GARBAGE_TIMER = UPDATE_TIMER * 4
+    DEFAULT_UPDATE_TIMER = 30
 
     def __init__(self, port=520, user_routes=None, importroutes=False,
-                 requested_ifaces=None, log_config="logging.conf"):
+                 requested_ifaces=None, log_config="logging.conf",
+                 base_timer=None):
         """port -- The UDP port to listen and send on (default 520).
         user_routes -- A list of routes to advertise.
         importroutes -- If True, look in the main kernel routing table for
             routes to import into RIP during startup.
         requested_ifaces -- A list of interface names to send updates out of.
             If None, use all interfaces.
-        log_config -- The logging config file (default logging.conf)"""
+        log_config -- The logging config file (default logging.conf)
+        base_timer -- Influences update/garbage/timeout timers"""
         self.init_logging(log_config)
+
+        log.addObserver(self._suppress_reactor_not_running)
+
+        if not base_timer:
+            base_timer = self.DEFAULT_UPDATE_TIMER
+
+        self.update_timer = base_timer
+        self.garbage_timer = base_timer * 4
+        self.timeout_timer = base_timer * 6
+        self.log.debug("Using timers: Update: %d, gc: %d, timeout: %d" % \
+                       (self.update_timer, self.garbage_timer,
+                        self.timeout_timer))
+
         self._route_change = False
         self._gc_started = False
         if sys.platform == "linux2":
@@ -95,6 +110,26 @@ class RIP(protocol.DatagramProtocol):
         reactor.callWhenRunning(self.generate_periodic_update)
         reactor.callWhenRunning(self._check_route_timeouts)
 
+    def _suppress_reactor_not_running(self, msg):
+        # reactor apparently calls reactor.stop() more than once when shutting
+        # down under certain circumstances, like when a signal goes uncaught
+        # (e.g. CTRL+C). It only does this sometimes. It prints a stacktrace
+        # to the console. I see several old (now-fixed) bug reports relating
+        # to this and some stackexchange threads discussing how to suppress
+        # these kinds of messages, but nothing that tells me how to get this
+        # to stop happening "the right way". Since I never call reactor.stop
+        # it seems like this is twisted's problem. This is kludgey but it
+        # works, and it shouldn't block any useful messages from being printed.
+        if msg['isError'] and msg["failure"].type == \
+           twisted.internet.error.ReactorNotRunning:
+            self.log.info("FIXME: Suppressing ReactorNotRunning error.")
+            for k in msg:
+                msg[k] = None
+
+    def stopProtocol(self):
+        self.log.info("RIP is shutting down.")
+        self.cleanup()
+
     def _start_garbage_collection(self, rt):
         self.log.debug("Starting garbage collection for route %s" % rt)
         rt.changed = True
@@ -108,8 +143,8 @@ class RIP(protocol.DatagramProtocol):
     def _check_route_timeouts(self):
         self.log.debug("Checking route timeouts...")
         now = datetime.datetime.now()
-        begin_invalid_time = now - datetime.timedelta(seconds=self.TIMEOUT_TIMER)
-        timeout_val = datetime.timedelta(seconds=self.TIMEOUT_TIMER)
+        begin_invalid_time = now - datetime.timedelta(seconds=self.timeout_timer)
+        timeout_val = datetime.timedelta(seconds=self.timeout_timer)
         lowest_timer = timeout_val
 
         for rt in self._routes:
@@ -132,13 +167,13 @@ class RIP(protocol.DatagramProtocol):
     def _init_garbage_collection_timer(self):
         if self._gc_started:
             return
-        reactor.callLater(self.GARBAGE_TIMER, self._collect_garbage_routes)
+        reactor.callLater(self.garbage_timer, self._collect_garbage_routes)
 
     def _collect_garbage_routes(self):
         self.log.debug("Collecting garbage routes...")
         now = datetime.datetime.now()
-        flush_before = now - datetime.timedelta(seconds=self.GARBAGE_TIMER)
-        max_wait_time = self.GARBAGE_TIMER + 1
+        flush_before = now - datetime.timedelta(seconds=self.garbage_timer)
+        max_wait_time = self.garbage_timer + 1
         lowest_route_timer = max_wait_time
 
         for rt in self._routes:
@@ -202,8 +237,8 @@ class RIP(protocol.DatagramProtocol):
             dst_port = self.port
 
         self.log.debug("Sending an update. Triggered = %d." % triggered)
-        header = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
-        msg = header
+        hdr = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
+        msg = hdr
 
         if not ifaces:
             ifaces_to_use = self.get_active_ifaces()
@@ -235,7 +270,7 @@ class RIP(protocol.DatagramProtocol):
                                    " Sending an update...")
                     self.send_update(msg, iface.ip.ip.exploded,
                                      dst_ip, dst_port)
-                    msg = header
+                    msg = hdr
                     route_count = 0
 
             if len(msg) > RIPHeader.SIZE:
@@ -254,7 +289,7 @@ class RIP(protocol.DatagramProtocol):
         """Get the amount of time until the next update. This is equal to
         the default update timer +/- a number of a seconds to create update
         jitter."""
-        return self.UPDATE_TIMER + random.randrange(-self.JITTER_VALUE,
+        return self.update_timer + random.randrange(-self.JITTER_VALUE,
                                                      self.JITTER_VALUE)
 
     def get_active_ifaces(self):
@@ -715,7 +750,7 @@ class RIPPacket(object):
     def _init_from_host(self, hdr, rtes):
         """Init using a header and rte list provided by the application."""
         if hdr.ver != 2:
-            raise(ValueError)
+            raise(ValueError("Only version 2 is supported."))
         self.hdr = hdr
         self.rtes = rtes
 
@@ -771,8 +806,7 @@ class RIPHeader(object):
             self.ver = ver
 
     def serialize(self):
-        # Always re-pack. XXX Update to checksum the packet fields and skip
-        # repacking if nothing has changed.
+        # Always re-pack
         return struct.pack(self.FORMAT, self.cmd, self.ver, 0)
 
 
@@ -783,7 +817,7 @@ class RIPRouteEntry(object):
     MAX_METRIC = 16
 
     def __init__(self, rawdata=None, address=None, mask=None, nexthop=None,
-                 metric=None, tag=0, src_ip=None, imported=False):
+                 metric=None, tag=0, src_ip=None, imported=False, afi=2):
         self.packed = None
         self.changed = False
         self.imported = imported
@@ -792,18 +826,17 @@ class RIPRouteEntry(object):
         if rawdata and src_ip:
             self._init_from_net(rawdata, src_ip)
         elif address and \
-             mask    and \
              nexthop and \
+             mask   != None and \
              metric != None and \
              tag    != None:
-            self._init_from_host(address, mask, nexthop, metric, tag)
+            self._init_from_host(address, mask, nexthop, metric, tag, afi)
         else:
             raise(ValueError)
 
-    def _init_from_host(self, address, mask, nexthop, metric, tag):
+    def _init_from_host(self, address, mask, nexthop, metric, tag, afi):
         """Init from data provided by the application."""
-        # IPv4 only supported
-        self.afi = 2
+        self.afi = afi
         self.network = ipaddr.IPv4Network(address + "/" + str(mask))
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
@@ -857,8 +890,7 @@ class RIPRouteEntry(object):
         over the network. This is the updated header from RFC 2453
         section 4."""
 
-        # Always re-pack. XXX Update to checksum the packet fields and skip
-        # repacking if nothing has changed.
+        # Always re-pack
         return struct.pack(self.FORMAT, self.afi, self.tag,
                                       self.network.network._ip,
                                       self.network.netmask._ip,
@@ -870,17 +902,6 @@ class RIPException(Exception):
 
 class FormatException(RIPException):
     pass
-
-
-class RIPFactory(protocol.Protocol):
-    def buildProtocol(self, addr):
-        return RIP()
-
-    def doStart(self):
-        pass
-
-    def doStop(self):
-        pass
 
 
 def parse_args(argv):
@@ -898,6 +919,10 @@ def parse_args(argv):
     op.add_option("-l", "--log-config", default="logging.conf",
                   help="The logging configuration file "
                         "(default logging.conf).")
+    op.add_option("-t", "--base-timer", type="int",
+                  help="Use non-default update/gc/timeout timers. The update "
+                  "timer is set to this value and gc/timeout timers are based "
+                  "on it")
 
     options, arguments = op.parse_args(argv)
     if not options.interface:
@@ -918,12 +943,9 @@ def main(argv):
         sys.stderr.write("Must run as root. Exiting.\n")
         sys.exit(1)
 
-    ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config)
+    ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer)
     reactor.listenMulticast(options.port, ripserv)
-    try:
-        reactor.run()
-    finally:
-        ripserv.cleanup()
+    reactor.run()
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
