@@ -92,7 +92,7 @@ class RIP(protocol.DatagramProtocol):
         # Setup admin interface
         ripadmin.start(self)
 
-        reactor.callWhenRunning(self.generate_update)
+        reactor.callWhenRunning(self.generate_periodic_update)
         reactor.callWhenRunning(self._check_route_timeouts)
 
     def _start_garbage_collection(self, rt):
@@ -195,19 +195,33 @@ class RIP(protocol.DatagramProtocol):
             if iface.activated == True:
                 self.transport.joinGroup("224.0.0.9", iface.ip.ip.exploded)
 
-    def generate_update(self, triggered=False):
+    def generate_update(self, triggered=False, ifaces=None, routes=None,
+                        dst_ip="224.0.0.9", dst_port=None, split_horizon=True):
         """Send an update message across the network."""
+        if not dst_port:
+            dst_port = self.port
+
         self.log.debug("Sending an update. Triggered = %d." % triggered)
         header = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
         msg = header
 
-        for iface in self.get_active_ifaces():
+        if not ifaces:
+            ifaces_to_use = self.get_active_ifaces()
+        else:
+            ifaces_to_use = ifaces
+
+        if not routes:
+            routes_to_use = self._routes
+        else:
+            routes_to_use = routes
+
+        for iface in ifaces_to_use:
             self.log.debug("Preparing update for interface %s" %
                            iface.phy_iface.name)
             route_count = 0
-            for rt in self._routes:
+            for rt in routes_to_use:
                 self.log.debug("Trying to add route to update: %s." % rt)
-                if rt.nexthop in iface.ip:
+                if split_horizon and rt.nexthop in iface.ip:
                     self.log.debug("Split horizon prevents sending route.")
                     continue
                 if triggered and not rt.changed:
@@ -219,18 +233,22 @@ class RIP(protocol.DatagramProtocol):
                 if route_count == self.MAX_ROUTES_PER_UPDATE:
                     self.log.debug("Max routes per update reached."
                                    " Sending an update...")
-                    self.send_update_multicast(msg, iface.ip.ip.exploded)
+                    self.send_update(msg, iface.ip.ip.exploded,
+                                     dst_ip, dst_port)
                     msg = header
                     route_count = 0
 
             if len(msg) > RIPHeader.SIZE:
-                self.send_update_multicast(msg, iface.ip.ip.exploded)
+                self.send_update(msg, iface.ip.ip.exploded, dst_ip, dst_port)
 
         if triggered:
             for rt in self._routes:
                 rt.changed = False
-        else:
-            reactor.callLater(self.get_update_interval(), self.generate_update)
+
+    def generate_periodic_update(self):
+        self.generate_update()
+        reactor.callLater(self.get_update_interval(),
+                          self.generate_periodic_update)
 
     def get_update_interval(self):
         """Get the amount of time until the next update. This is equal to
@@ -245,27 +263,28 @@ class RIP(protocol.DatagramProtocol):
             if iface.activated:
                 yield iface
 
-    def send_update_multicast(self, msg, ip):
-        self.transport.setOutgoingInterface(ip)
-        self.transport.write(msg, ("224.0.0.9", self.port))
+    def send_update(self, msg, src_iface_ip, dst_ip="224.0.0.9",
+                    dst_port=None):
+        if not dst_port:
+            dst_port = self.port
+
+        self.transport.setOutgoingInterface(src_iface_ip)
+        self.transport.write(msg, (dst_ip, dst_port))
 
     def datagramReceived(self, data, (host, port)):
-        if port != self.port:
-            self.log.debug("Advertisement source port was not the RIP port. "
-                           "Ignoring.")
-            return
-
         self.log.debug("Processing a datagram from host %s." % host)
 
         link_local = False
+        host_local = False
         host = ipaddr.IPv4Address(host)
         for local_iface in self._sys.logical_ifaces:
-            if local_iface.ip.ip.exploded == host.exploded:
-                self.log.debug("Ignoring message from local system.")
-                return
-            elif host in local_iface.ip:
+            if host in local_iface.ip:
                 link_local = True
+            if local_iface.ip.ip.exploded == host.exploded:
+                host_local = True
+            if host_local or link_local:
                 break
+
         if not link_local:
             self.log.warn("Received advertisement from non link-local "
                           "host. Ignoring.")
@@ -282,16 +301,59 @@ class RIP(protocol.DatagramProtocol):
             self.log.debug(traceback.format_exc())
             return
 
-        if msg.header.cmd == RIPHeader.TYPE_REQUEST:
-            self.process_request(msg)
-        elif msg.header.cmd == RIPHeader.TYPE_RESPONSE:
-            self.process_response(msg)
+        if msg.hdr.cmd == RIPHeader.TYPE_REQUEST:
+            self.process_request(msg, host, port, local_iface)
+        elif msg.hdr.cmd == RIPHeader.TYPE_RESPONSE:
+            if host_local:
+                self.log.debug("Ignoring message from local system.")
+                return
+            if port != self.port:
+                self.log.debug("Advertisement source port was not the RIP "
+                               "port.  Ignoring.")
+                return
 
-    def process_request(self, msg):
-        pass
+            self.process_response(msg)
+        else:
+            self.log.warn("Received a packet with a command field that was "
+                          "not REQUEST or RESPONSE from %s:%d. Command = %d" % \
+                           (host, port, msg.hdr.cmd))
+            return
+
+    def process_request(self, msg, host, port, local_iface):
+        # See RFC 2453 section 3.9.1
+        if not msg.rtes:
+            return
+        elif len(msg.rtes) == 1   and \
+             msg.rtes[0].afi == 0 and \
+             msg.rtes[0].metric == RIPRouteEntry.MAX_METRIC:
+            self._send_whole_response(host, port, local_iface)
+        else:
+            self._send_partial_response(host, port, msg)
+
+    def _send_whole_response(self, host, port, local_iface):
+        """Provide the metric and nexthop address for known routes. Split
+        horizon processing is performed. This is the "whole-table" case from
+        RFC 2453 section 3.9.1."""
+        self.generate_update(ifaces=[local_iface], dst_ip=host.exploded,
+                             dst_port=port)
+
+    def _send_partial_response(self, host, port, msg):
+        """Provide the metric and nexthop address for every RTE in msg. No
+        split horizon is performed. This is the "specific" case from RFC 2453
+        section 3.9.1."""
+        for rt in msg.rtes:
+            matching_rt = self.get_route(rt.network.ip.exploded,
+                                         rt.network.netmask.exploded)
+            if not matching_rt:
+                rt.metric = RIPRouteEntry.MAX_METRIC
+            else:
+                rt.metric = matching_rt.metric
+
+        msg.hdr.cmd = RIPHeader.TYPE_RESPONSE
+        self.transport.write(msg.serialize(), (host.exploded, port))
 
     def process_response(self, msg):
-        for rte in msg.rtelist:
+        for rte in msg.rtes:
             # XXX Should update to use the metric of the incoming interface
             rte.metric = min(rte.metric + 1, RIPRouteEntry.MAX_METRIC)
             self.try_add_route(rte)
@@ -625,7 +687,7 @@ class RIPPacket(object):
 
     def __repr__(self):
         return "RIPPacket: Command %d, Version %d, number of RTEs %d." % \
-                (self.header.cmd, self.header.ver, len(self.rtelist))
+                (self.hdr.cmd, self.hdr.ver, len(self.rtes))
 
     def _init_from_net(self, data, src_ip):
         """Init from data received from the network."""
@@ -635,19 +697,17 @@ class RIPPacket(object):
             raise(FormatException)
 
         malformed_rtes = (datalen - RIPHeader.SIZE) % RIPRouteEntry.SIZE
-        if malformed_rtes != 0:
+        if malformed_rtes:
             raise(FormatException)
 
         numrtes = (datalen - RIPHeader.SIZE) / RIPRouteEntry.SIZE
-        self.header = RIPHeader(data[0:RIPHeader.SIZE])
+        self.hdr = RIPHeader(data[0:RIPHeader.SIZE])
 
-        # Route entries
-        self.rtelist = []
-
+        self.rtes = []
         rte_start = RIPHeader.SIZE
         rte_end = RIPHeader.SIZE + RIPRouteEntry.SIZE
         for i in range(numrtes):
-            self.rtelist.append(RIPRouteEntry(rawdata=data[rte_start:rte_end],
+            self.rtes.append(RIPRouteEntry(rawdata=data[rte_start:rte_end],
                                               src_ip=src_ip))
             rte_start += RIPRouteEntry.SIZE
             rte_end += RIPRouteEntry.SIZE
@@ -657,16 +717,17 @@ class RIPPacket(object):
         if hdr.ver != 2:
             raise(ValueError)
         self.hdr = hdr
-        self.rtelist = rtes
+        self.rtes = rtes
 
     def serialize(self):
         """Return a bytestring representing this packet in a form that
         can be transmitted across the network."""
-        if not self.packed:
-            self.packed = self.hdr.serialize()
-            for rte in self.rtelist:
-                self.packed += rte.serialize()
-        return self.packed
+
+        # Always re-pack in case the header or rtes have changed.
+        packed = self.hdr.serialize()
+        for rte in self.rtes:
+            packed += rte.serialize()
+        return packed
 
 
 class RIPHeader(object):
@@ -710,9 +771,9 @@ class RIPHeader(object):
             self.ver = ver
 
     def serialize(self):
-        if not self.packed:
-            self.packed = struct.pack(self.FORMAT, self.cmd, self.ver, 0)
-        return self.packed
+        # Always re-pack. XXX Update to checksum the packet fields and skip
+        # repacking if nothing has changed.
+        return struct.pack(self.FORMAT, self.cmd, self.ver, 0)
 
 
 class RIPRouteEntry(object):
@@ -743,7 +804,7 @@ class RIPRouteEntry(object):
         """Init from data provided by the application."""
         # IPv4 only supported
         self.afi = 2
-        self.network = ipaddr.IPv4Network(address + "/" + mask)
+        self.network = ipaddr.IPv4Network(address + "/" + str(mask))
         self.nexthop = ipaddr.IPv4Address(nexthop)
         self.metric = metric
         self.tag = tag
@@ -795,13 +856,13 @@ class RIPRouteEntry(object):
         """Format into typical RIPv2 header format suitable to be sent
         over the network. This is the updated header from RFC 2453
         section 4."""
-        if not self.packed:
-            self.packed = struct.pack(self.FORMAT, self.afi, self.tag,
+
+        # Always re-pack. XXX Update to checksum the packet fields and skip
+        # repacking if nothing has changed.
+        return struct.pack(self.FORMAT, self.afi, self.tag,
                                       self.network.network._ip,
                                       self.network.netmask._ip,
                                       self.nexthop._ip, self.metric)
-        return self.packed
-
 
 class RIPException(Exception):
     pass
