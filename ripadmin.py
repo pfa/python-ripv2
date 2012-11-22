@@ -34,7 +34,6 @@ class RIPAdminProtocol(LineReceiver):
             self.transport.write(self.cli.onecmd(line))
             self.transport.write(self.cli.prompt)
         except RIPAdminExit:
-            self.transport.write("Disconnecting by operator command.\n")
             self.transport.loseConnection()
 
 
@@ -49,6 +48,7 @@ class RIPAdminCLI(Cmd):
 
     def do_EOF(self, line):
         """Exit the CLI."""
+        self.sendline("Disconnecting by operator command.\n")
         raise RIPAdminExit
 
     def do_show_routes(self, line):
@@ -166,4 +166,4 @@ class RIPAdminProtocolFactory(protocol.ServerFactory):
 
 
 def start(ripinstance=None, prompt="ripadmin> ", port=5120):
-    reactor.listenTCP(5120, RIPAdminProtocolFactory(ripinstance, prompt))
+    reactor.listenTCP(port, RIPAdminProtocolFactory(ripinstance, prompt))

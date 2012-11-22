@@ -238,7 +238,6 @@ class RIP(protocol.DatagramProtocol):
 
         self.log.debug("Sending an update. Triggered = %d." % triggered)
         hdr = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
-        msg = hdr
 
         if not ifaces:
             ifaces_to_use = self.get_active_ifaces()
@@ -251,6 +250,7 @@ class RIP(protocol.DatagramProtocol):
             routes_to_use = routes
 
         for iface in ifaces_to_use:
+            msg = hdr
             self.log.debug("Preparing update for interface %s" %
                            iface.phy_iface.name)
             route_count = 0
