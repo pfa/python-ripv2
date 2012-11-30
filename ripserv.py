@@ -65,7 +65,7 @@ class RIP(protocol.DatagramProtocol):
         self.update_timer = base_timer
         self.garbage_timer = base_timer * 4
         self.timeout_timer = base_timer * 6
-        self.log.debug("Using timers: Update: %d, gc: %d, timeout: %d" % \
+        self.log.debug1("Using timers: Update: %d, gc: %d, timeout: %d" % \
                        (self.update_timer, self.garbage_timer,
                         self.timeout_timer))
 
@@ -74,7 +74,7 @@ class RIP(protocol.DatagramProtocol):
         if sys.platform == "linux2":
             self._sys = LinuxRIPSystem(log_config=log_config)
         else:
-            raise(NotImplemented("No support for current OS."))
+            raise(NotSupported("No support for current OS."))
         self.port = port
         self._routes = []
         self._garbage_routes = []
@@ -198,6 +198,19 @@ class RIP(protocol.DatagramProtocol):
             reactor.callLater(next_call_time, self._collect_garbage_routes)
 
     def init_logging(self, log_config):
+        # debug5 is less verbose, debug0 is more verbose.
+        for (level, name) in [ (10, "DEBUG0"),
+                               (11, "DEBUG1"),
+                               (12, "DEBUG2"),
+                               (13, "DEBUG3"),
+                               (14, "DEBUG4"),
+                               (15, "DEBUG5") ]:
+            def newlog(self, msg, level=level, *args, **kwargs):
+                if self.isEnabledFor(level):
+                    self._log(level, msg, args, **kwargs)
+            logging.addLevelName(level, name)
+            setattr(logging.Logger, name.lower(), newlog)
+
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
         self.log = logging.getLogger("RIP")
 
@@ -498,13 +511,13 @@ class _RIPSystem(object):
         using a delete followed by an add, that could also be used.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def cleanup(self):
         """Clean up the system. Called when exiting.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def update_interface_info(self):
         """Updates self according to the current state of physical and logical
@@ -515,19 +528,19 @@ class _RIPSystem(object):
         LinuxPhysicalInterface and LinuxLogicalInterface classes for examples.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def uninstall_route(self, net, mask):
         """Uninstall a route from the system routing table.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def install_route(self, net, preflen, metric, nexthop):
         """Install a route in the system routing table.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def get_local_routes(self):
         """Retrieves routes from the system routing table.
@@ -535,7 +548,7 @@ class _RIPSystem(object):
         Return value is a list of RIPRouteEntry objects defining local routes.
 
         Override in subclass."""
-        raise(NotImplemented)
+        assert(False)
 
     def is_self(self, host):
         """Determines if an IP address belongs to the local machine.
@@ -543,8 +556,8 @@ class _RIPSystem(object):
         Returns True if so, otherwise returns False.
 
         Override in subclass."""
+        assert(False)
 
-        raise(NotImplemented)
 
 class LinuxRIPSystem(_RIPSystem):
     """The Linux interface for RIP."""
@@ -896,11 +909,16 @@ class RIPRouteEntry(object):
                                       self.network.netmask._ip,
                                       self.nexthop._ip, self.metric)
 
-class RIPException(Exception):
+class _RIPException(Exception):
+    def __init__(self, message=""):
+        self.message = message
+
+
+class FormatException(_RIPException):
     pass
 
 
-class FormatException(RIPException):
+class NotSupported(_RIPException):
     pass
 
 
