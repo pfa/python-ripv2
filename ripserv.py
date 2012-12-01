@@ -56,6 +56,7 @@ class RIP(protocol.DatagramProtocol):
         log_config -- The logging config file (default logging.conf)
         base_timer -- Influences update/garbage/timeout timers"""
         self.init_logging(log_config)
+        self.log.info("RIP is starting up...")
 
         log.addObserver(self._suppress_reactor_not_running)
 
@@ -94,7 +95,7 @@ class RIP(protocol.DatagramProtocol):
                                     metric=metric,
                                     tag=tag,
                                     imported=True)
-                self.log.debug("Trying to add user route %s" % rte)
+                self.log.debug5("Trying to add user route %s" % rte)
                 self.try_add_route(rte, False)
 
         if importroutes:
@@ -131,7 +132,7 @@ class RIP(protocol.DatagramProtocol):
         self.cleanup()
 
     def _start_garbage_collection(self, rt):
-        self.log.debug("Starting garbage collection for route %s" % rt)
+        self.log.debug2("Starting garbage collection for route %s" % rt)
         rt.changed = True
         rt.garbage = True
         rt.init_timeout()
@@ -141,7 +142,7 @@ class RIP(protocol.DatagramProtocol):
         self._init_garbage_collection_timer()
 
     def _check_route_timeouts(self):
-        self.log.debug("Checking route timeouts...")
+        self.log.debug2("Checking route timeouts...")
         now = datetime.datetime.now()
         begin_invalid_time = now - datetime.timedelta(seconds=self.timeout_timer)
         timeout_val = datetime.timedelta(seconds=self.timeout_timer)
@@ -152,7 +153,7 @@ class RIP(protocol.DatagramProtocol):
                 if rt.timeout == None:
                     continue
                 if rt.timeout < begin_invalid_time:
-                    self.log.debug("Adding route to GC: %s" % rt)
+                    self.log.debug2("Adding route to GC: %s" % rt)
                     self._start_garbage_collection(rt)
                 else:
                     current_timer = (rt.timeout + timeout_val) - now
@@ -160,7 +161,7 @@ class RIP(protocol.DatagramProtocol):
                                         current_timer)
 
         next_call_time = lowest_timer.total_seconds() + 1
-        self.log.debug("Checking timeouts again in %d second(s)" %
+        self.log.debug2("Checking timeouts again in %d second(s)" %
                        next_call_time)
         reactor.callLater(next_call_time, self._check_route_timeouts)
 
@@ -170,7 +171,7 @@ class RIP(protocol.DatagramProtocol):
         reactor.callLater(self.garbage_timer, self._collect_garbage_routes)
 
     def _collect_garbage_routes(self):
-        self.log.debug("Collecting garbage routes...")
+        self.log.debug2("Collecting garbage routes...")
         now = datetime.datetime.now()
         flush_before = now - datetime.timedelta(seconds=self.garbage_timer)
         max_wait_time = self.garbage_timer + 1
@@ -181,7 +182,7 @@ class RIP(protocol.DatagramProtocol):
                 if rt.timeout == None:
                     continue
                 if rt.timeout < flush_before:
-                    self.log.debug("Deleting route: %s" % rt)
+                    self.log.debug2("Deleting route: %s" % rt)
                     self._sys.uninstall_route(rt.network.ip.exploded,
                                               rt.network.prefixlen)
                     self._routes.remove(rt)
@@ -189,27 +190,23 @@ class RIP(protocol.DatagramProtocol):
                     lowest_route_timer = min(rt.timeout, lowest_route_timer)
 
         if lowest_route_timer == max_wait_time:
-            self.log.debug("No more routes on GC.")
+            self.log.debug2("No more routes on GC.")
             self._gc_started = False
         else:
             next_call_time = (now - lowest_route_timer).total_seconds() + 1
-            self.log.debug("Collecting garbage routes again in %d seconds" %
+            self.log.debug2("Collecting garbage routes again in %d seconds" %
                            next_call_time)
             reactor.callLater(next_call_time, self._collect_garbage_routes)
 
     def init_logging(self, log_config):
-        # debug5 is less verbose, debug0 is more verbose.
-        for (level, name) in [ (10, "DEBUG0"),
-                               (11, "DEBUG1"),
-                               (12, "DEBUG2"),
-                               (13, "DEBUG3"),
-                               (14, "DEBUG4"),
-                               (15, "DEBUG5") ]:
-            def newlog(self, msg, level=level, *args, **kwargs):
-                if self.isEnabledFor(level):
-                    self._log(level, msg, args, **kwargs)
-            logging.addLevelName(level, name)
-            setattr(logging.Logger, name.lower(), newlog)
+        # debug1 is less verbose, debug9 is more verbose.
+        for (level, name) in [ (10, "DEBUG1"),
+                               (9, "DEBUG2"),
+                               (8, "DEBUG3"),
+                               (7, "DEBUG4"),
+                               (6, "DEBUG5"),
+                             ]:
+            self._create_new_log_level(level, name)
 
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
         self.log = logging.getLogger("RIP")
@@ -223,7 +220,8 @@ class RIP(protocol.DatagramProtocol):
         usable_sys_ifaces = []
         for sys_iface in self._sys.logical_ifaces:
             if sys_iface.usable():
-                self.log.debug("Iface %s is usable." % sys_iface.phy_iface.name)
+                self.log.debug5("Iface %s is usable." %
+                                sys_iface.phy_iface.name)
                 usable_sys_ifaces.append(sys_iface)
 
         for req_iface in requested_ifaces:
@@ -249,7 +247,7 @@ class RIP(protocol.DatagramProtocol):
         if not dst_port:
             dst_port = self.port
 
-        self.log.debug("Sending an update. Triggered = %d." % triggered)
+        self.log.debug2("Sending an update. Triggered = %d." % triggered)
         hdr = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
 
         if not ifaces:
@@ -264,22 +262,22 @@ class RIP(protocol.DatagramProtocol):
 
         for iface in ifaces_to_use:
             msg = hdr
-            self.log.debug("Preparing update for interface %s" %
+            self.log.debug4("Preparing update for interface %s" %
                            iface.phy_iface.name)
             route_count = 0
             for rt in routes_to_use:
-                self.log.debug("Trying to add route to update: %s." % rt)
+                self.log.debug5("Trying to add route to update: %s." % rt)
                 if split_horizon and rt.nexthop in iface.ip:
-                    self.log.debug("Split horizon prevents sending route.")
+                    self.log.debug5("Split horizon prevents sending route.")
                     continue
                 if triggered and not rt.changed:
-                    self.log.debug("Route not changed. Skipping.")
+                    self.log.debug5("Route not changed. Skipping.")
                     continue
                 msg += rt.serialize()
-                self.log.debug("Adding route to update.")
+                self.log.debug5("Adding route to update.")
                 route_count += 1
                 if route_count == self.MAX_ROUTES_PER_UPDATE:
-                    self.log.debug("Max routes per update reached."
+                    self.log.debug5("Max routes per update reached."
                                    " Sending an update...")
                     self.send_update(msg, iface.ip.ip.exploded,
                                      dst_ip, dst_port)
@@ -320,7 +318,7 @@ class RIP(protocol.DatagramProtocol):
         self.transport.write(msg, (dst_ip, dst_port))
 
     def datagramReceived(self, data, (host, port)):
-        self.log.debug("Processing a datagram from host %s." % host)
+        self.log.debug2("Processing a datagram from host %s." % host)
 
         link_local = False
         host_local = False
@@ -334,29 +332,29 @@ class RIP(protocol.DatagramProtocol):
                 break
 
         if not link_local:
-            self.log.warn("Received advertisement from non link-local "
+            self.log.warn5("Received advertisement from non link-local "
                           "host. Ignoring.")
             return
 
         try:
             msg = RIPPacket(data=data, src_ip=host.exploded)
-            self.log.debug(msg)
+            self.log.debug5(msg)
         except FormatException:
             self.log.warn("RIP packet with invalid format received.")
-            self.log.debug("Hex dump:")
-            self.log.debug(binascii.hexlify(data))
-            self.log.debug("Traceback:")
-            self.log.debug(traceback.format_exc())
+            self.log.debug5("Hex dump:")
+            self.log.debug1(binascii.hexlify(data))
+            self.log.debug1("Traceback:")
+            self.log.debug1(traceback.format_exc())
             return
 
         if msg.hdr.cmd == RIPHeader.TYPE_REQUEST:
             self.process_request(msg, host, port, local_iface)
         elif msg.hdr.cmd == RIPHeader.TYPE_RESPONSE:
             if host_local:
-                self.log.debug("Ignoring message from local system.")
+                self.log.debug5("Ignoring message from local system.")
                 return
             if port != self.port:
-                self.log.debug("Advertisement source port was not the RIP "
+                self.log.debug5("Advertisement source port was not the RIP "
                                "port.  Ignoring.")
                 return
 
@@ -423,12 +421,12 @@ class RIP(protocol.DatagramProtocol):
                               self._send_triggered_update)
 
     def _send_triggered_update(self):
-        self.log.debug("Sending triggered update.")
+        self.log.debug2("Sending triggered update.")
         self._route_change = False
         self.generate_update(triggered=True)
 
     def try_add_route(self, rte, install=True):
-        self.log.debug("try_add_route: Received %s" % rte)
+        self.log.debug5("try_add_route: Received %s" % rte)
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
@@ -451,7 +449,7 @@ class RIP(protocol.DatagramProtocol):
                     elif rte.metric != bestroute.metric:
                         self.update_route(bestroute, rte)
             elif rte.metric < bestroute.metric:
-                self.log.debug("Found better route to %s via %s in %d", \
+                self.log.debug3("Found better route to %s via %s in %d", \
                                (rte.network.exploded, rte.nexthop, rte.metric))
                 self.update_route(bestroute, rte)
 
@@ -481,6 +479,14 @@ class RIP(protocol.DatagramProtocol):
             if rt.nexthop.exploded != "0.0.0.0":
                 self._sys.uninstall_route(rt.network.ip.exploded,
                                           rt.network.prefixlen)
+
+    @staticmethod
+    def _create_new_log_level(level, name):
+        def newlog(self, msg, level=level, *args, **kwargs):
+            if self.isEnabledFor(level):
+                self._log(level, msg, args, **kwargs)
+        logging.addLevelName(level, name)
+        setattr(logging.Logger, name.lower(), newlog)
 
 
 class _RIPSystem(object):
