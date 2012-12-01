@@ -448,6 +448,8 @@ class RIP(protocol.DatagramProtocol):
                         self._start_garbage_collection(rte)
                     elif rte.metric != bestroute.metric:
                         self.update_route(bestroute, rte)
+                else:
+                    bestroute.init_timeout()
             elif rte.metric < bestroute.metric:
                 self.log.debug3("Found better route to %s via %s in %d", \
                                (rte.network.exploded, rte.nexthop, rte.metric))
