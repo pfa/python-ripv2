@@ -33,6 +33,7 @@ from twisted.internet import protocol
 from twisted.internet import reactor
 from twisted.python import log
 import twisted.python.failure
+import traceback
 
 import ripadmin
 
@@ -79,13 +80,14 @@ class RIP(protocol.DatagramProtocol):
         self.port = port
         self._routes = []
         self._garbage_routes = []
+
+        # Nexthop of 0.0.0.0 tells receivers to use the source IP on the
+        # packet for the nexthop address. See RFC 2453 section 4.4.
+        nexthop = "0.0.0.0"
+
         if user_routes:
             metric = 0
             tag = 0
-
-            # Nexthop of 0.0.0.0 tells receivers to use the source IP on the
-            # packet for the nexthop address. See RFC 2453 section 4.4.
-            nexthop = "0.0.0.0"
 
             for route in user_routes:
                 parsed_rt = ipaddr.IPv4Network(route)
@@ -96,11 +98,11 @@ class RIP(protocol.DatagramProtocol):
                                     tag=tag,
                                     imported=True)
                 self.log.debug5("Trying to add user route %s" % rte)
-                self.try_add_route(rte, False)
+                self.try_add_route(rte, nexthop, False)
 
         if importroutes:
             for rt in self._sys.get_local_routes():
-                self.try_add_route(rt, False)
+                self.try_add_route(rt, nexthop, False)
 
         self.activate_ifaces(requested_ifaces)
         self._last_trigger_time = datetime.datetime.now()
@@ -132,6 +134,10 @@ class RIP(protocol.DatagramProtocol):
         self.cleanup()
 
     def _start_garbage_collection(self, rt):
+        if rt.garbage:
+            self.log.debug2("Route was already on GC: %s" % rt)
+            return
+
         self.log.debug2("Starting garbage collection for route %s" % rt)
         rt.changed = True
         rt.garbage = True
@@ -187,7 +193,7 @@ class RIP(protocol.DatagramProtocol):
                                               rt.network.prefixlen)
                     self._routes.remove(rt)
                 else:
-                    lowest_route_timer = min(rt.timeout, lowest_route_timer)
+                    lowest_route_timer = min(datetime.timedelta(seconds=self.garbage_timer), lowest_route_timer)
 
         if lowest_route_timer == max_wait_time:
             self.log.debug2("No more routes on GC.")
@@ -358,7 +364,7 @@ class RIP(protocol.DatagramProtocol):
                                "port.  Ignoring.")
                 return
 
-            self.process_response(msg)
+            self.process_response(msg, host)
         else:
             self.log.warn("Received a packet with a command field that was "
                           "not REQUEST or RESPONSE from %s:%d. Command = %d" % \
@@ -398,11 +404,11 @@ class RIP(protocol.DatagramProtocol):
         msg.hdr.cmd = RIPHeader.TYPE_RESPONSE
         self.transport.write(msg.serialize(), (host.exploded, port))
 
-    def process_response(self, msg):
+    def process_response(self, msg, host):
         for rte in msg.rtes:
             # XXX Should update to use the metric of the incoming interface
             rte.metric = min(rte.metric + 1, RIPRouteEntry.MAX_METRIC)
-            self.try_add_route(rte)
+            self.try_add_route(rte, host)
 
     def handle_route_change(self):
         if self._route_change:
@@ -425,12 +431,16 @@ class RIP(protocol.DatagramProtocol):
         self._route_change = False
         self.generate_update(triggered=True)
 
-    def try_add_route(self, rte, install=True):
+    def try_add_route(self, rte, host, install=True):
         self.log.debug5("try_add_route: Received %s" % rte)
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
 
+        rte.set_nexthop(host)
         if not bestroute:
+            if rte.metric == RIPRouteEntry.MAX_METRIC:
+                return
+
             rte.changed = True
             self._routes.append(rte)
 
@@ -445,13 +455,13 @@ class RIP(protocol.DatagramProtocol):
                 if bestroute.metric != rte.metric:
                     if bestroute.metric != RIPRouteEntry.MAX_METRIC and \
                        rte.metric >= RIPRouteEntry.MAX_METRIC:
-                        self._start_garbage_collection(rte)
-                    elif rte.metric != bestroute.metric:
+                        self._start_garbage_collection(bestroute)
+                    else:
                         self.update_route(bestroute, rte)
-                else:
+                elif not bestroute.garbage:
                     bestroute.init_timeout()
             elif rte.metric < bestroute.metric:
-                self.log.debug3("Found better route to %s via %s in %d", \
+                self.log.debug3("Found better route to %s via %s in %d" % \
                                (rte.network.exploded, rte.nexthop, rte.metric))
                 self.update_route(bestroute, rte)
 
@@ -858,10 +868,16 @@ class RIPRouteEntry(object):
     def _init_from_host(self, address, mask, nexthop, metric, tag, afi):
         """Init from data provided by the application."""
         self.afi = afi
-        self.network = ipaddr.IPv4Network(address + "/" + str(mask))
-        self.nexthop = ipaddr.IPv4Address(nexthop)
+        self.set_network(address, mask)
+        self.set_nexthop(nexthop)
         self.metric = metric
         self.tag = tag
+
+    def set_network(self, address, mask):
+        self.network = ipaddr.IPv4Network(address + "/" + str(mask))
+
+    def set_nexthop(self, nexthop):
+        self.nexthop = ipaddr.IPv4Address(nexthop)
 
     def init_timeout(self):
         """Sets a timer to the current time. The timer is used as either the
@@ -880,13 +896,13 @@ class RIPRouteEntry(object):
         self.tag = rte[1]
         address = ipaddr.IPv4Address(rte[2])
         mask = ipaddr.IPv4Address(rte[3])
-        self.nexthop = ipaddr.IPv4Address(rte[4])
+
+        self.set_nexthop(rte[4])
         self.metric = rte[5]
 
         if self.nexthop.exploded == "0.0.0.0":
-            self.nexthop = ipaddr.IPv4Address(src_ip)
-        self.network = ipaddr.IPv4Network(address.exploded + "/" +
-                                          mask.exploded)
+            self.set_nexthop(src_ip)
+        self.set_network(address.exploded, mask.exploded)
 
         # Validation
         if not (self.MIN_METRIC <= self.metric <= self.MAX_METRIC):
