@@ -16,7 +16,6 @@
 # You should have received a copy of the GNU General Public License
 # along with this program; if not, write to the Free Software
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
-# XXX test
 
 import struct
 import ipaddr
@@ -75,6 +74,8 @@ class RIP(protocol.DatagramProtocol):
         self._gc_started = False
         if sys.platform == "linux2":
             self._sys = LinuxRIPSystem(log_config=log_config)
+        elif sys.platform.startswith("win"):
+            self._sys = WindowsRIPSystem(log_config=log_config)
         else:
             raise(NotSupported("No support for current OS."))
         self.port = port
@@ -331,7 +332,7 @@ class RIP(protocol.DatagramProtocol):
                 break
 
         if not link_local:
-            self.log.warn5("Received advertisement from non link-local "
+            self.log.warn("Received advertisement from non link-local "
                           "host. Ignoring.")
             return
 
@@ -510,6 +511,9 @@ class _RIPSystem(object):
         log_config -- The logging configuration file."""
         kwargs.setdefault("log_config", "logging.conf")
         self.init_logging(kwargs["log_config"])
+        self.update_interface_info()
+        self.loopback = "127.0.0.1"
+        self._route_change = False
 
     def modify_route(self, rt):
         """Update the system routing table to use a new metric and nexthop
@@ -570,6 +574,44 @@ class _RIPSystem(object):
         assert(False)
 
 
+class WindowsRIPSystem(_RIPSystem):
+    """The Windows interface for RIP."""
+
+    def __init__(self, *args, **kwargs):
+        super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
+
+    def modify_route(self, rt):
+        pass
+
+    def cleanup(self):
+        pass
+
+    def update_interface_info(self):
+        ipconfig_output = subprocess.check_output("ipconfig")
+        
+        self.phy_ifaces = []
+        self.logical_ifaces = []
+
+        # XXX Extract actual physical interfaces... though these aren't really
+        # used now anyway except for debug messages.
+        self.phy_ifaces.append(PhysicalInterface("WindowsPhysicalInterface",
+                               None))
+        for ip in re.findall("IPv4 Address.*: (.*)\r", ipconfig_output):
+            self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0], ip))        
+
+    def uninstall_route(self, net, mask):
+        pass
+
+    def install_route(self, net, preflen, metric, nexthop):
+        pass
+
+    def get_local_routes(self):
+        return []
+
+    def is_self(self, host):
+        return True
+
+
 class LinuxRIPSystem(_RIPSystem):
     """The Linux interface for RIP."""
 
@@ -578,7 +620,7 @@ class LinuxRIPSystem(_RIPSystem):
     RT_ADD_ARGS = "route add %(net)s/%(mask)s via %(nh)s metric %(metric)d " \
                   "table %(table)d" 
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, table=52, priority=1000, *args, **kwargs):
         """Args:
         table -- the routing table to install routes to (if applicable on
             the platform RIP is running on).
@@ -586,21 +628,15 @@ class LinuxRIPSystem(_RIPSystem):
             relative to other routing daemons (if applicable on the platform
             RIP is running on)."""
         super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
-        kwargs.setdefault("table", 52)
-        kwargs.setdefault("priority", 1000)
 
-        self.table = kwargs["table"]
-        self.priority = kwargs["priority"]
+        self.table = table
+        self.priority = priority
 
         if self.table > 255 or self.table < 0:
             raise(ValueError)
         if self.priority > 32767 or self.priority < 0:
             raise(ValueError)
-
         self._install_rule()
-        self.update_interface_info()
-        self.loopback = "127.0.0.1"
-        self._route_change = False
 
     def modify_route(self, rt):
         """Update the metric and nexthop address to a prefix."""
