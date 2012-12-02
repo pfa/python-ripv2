@@ -28,7 +28,6 @@ import logging
 import logging.config
 import random
 import datetime
-import traceback
 from twisted.internet import protocol
 from twisted.internet import reactor
 from twisted.python import log
@@ -205,7 +204,7 @@ class RIP(protocol.DatagramProtocol):
             reactor.callLater(next_call_time, self._collect_garbage_routes)
 
     def init_logging(self, log_config):
-        # debug1 is less verbose, debug9 is more verbose.
+        # debug1 is less verbose, debug5 is more verbose.
         for (level, name) in [ (10, "DEBUG1"),
                                (9, "DEBUG2"),
                                (8, "DEBUG3"),
