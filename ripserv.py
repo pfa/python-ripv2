@@ -979,10 +979,11 @@ def main(argv):
     options, arguments = parse_args(argv)
 
     # Must run as root to manipulate the routing table.
-    userid = subprocess.check_output("id -u".split()).rstrip()
-    if userid != "0":
-        sys.stderr.write("Must run as root. Exiting.\n")
-        sys.exit(1)
+    if sys.platform.startswith("linux"):
+        userid = subprocess.check_output("id -u".split()).rstrip()
+        if userid != "0":
+            sys.stderr.write("Must run as root. Exiting.\n")
+            sys.exit(1)
 
     ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer)
     reactor.listenMulticast(options.port, ripserv)
