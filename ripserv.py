@@ -223,16 +223,9 @@ class RIP(protocol.DatagramProtocol):
         if not requested_ifaces:
             raise(ValueError("Need one or more interface IPs to listen on."))
 
-        usable_sys_ifaces = []
-        for sys_iface in self._sys.logical_ifaces:
-            if sys_iface.usable():
-                self.log.debug5("Iface %s is usable." %
-                                sys_iface.phy_iface.name)
-                usable_sys_ifaces.append(sys_iface)
-
         for req_iface in requested_ifaces:
             activated_iface = False
-            for sys_iface in usable_sys_ifaces:
+            for sys_iface in self._sys.logical_ifaces:
                 if req_iface == sys_iface.ip.ip.exploded:
                     sys_iface.activated = True
                     activated_iface = True
@@ -543,7 +536,7 @@ class _RIPSystem(object):
 
         Sets self.phy_ifaces and self.logical_ifaces to be lists of
         physical interfaces and logical interfaces, respectively. See
-        LinuxPhysicalInterface and LinuxLogicalInterface classes for examples.
+        PhysicalInterface and LogicalInterface classes for examples.
 
         Override in subclass."""
         assert(False)
@@ -647,10 +640,10 @@ class LinuxRIPSystem(_RIPSystem):
             name = re.match("(.*):", iface).group(1)
             flags = re.search("<(\S*)> ", iface).group(1).split(",")
             addrs = []
-            phy_iface = LinuxPhysicalInterface(name, flags)
+            phy_iface = PhysicalInterface(name, flags)
             self.phy_ifaces.append(phy_iface)
             for addr in re.findall("\n\s*inet (\S*)", iface):
-                logical_iface = LinuxLogicalInterface(phy_iface, addr)
+                logical_iface = LogicalInterface(phy_iface, addr)
                 self.logical_ifaces.append(logical_iface)
 
     def uninstall_route(self, net, mask):
@@ -708,30 +701,18 @@ class LinuxRIPSystem(_RIPSystem):
         return False
 
 
-class LinuxPhysicalInterface(object):
+class PhysicalInterface(object):
     def __init__(self, name, flags):
         self.name = name
         self._flags = flags
 
-    def multicast_enabled(self):
-        return "MULTICAST" in self._flags
 
-    def operational(self):
-        return "UP" in self._flags and "LOWER_UP" in self._flags
-
-    def usable(self):
-        return self.multicast_enabled() and self.operational()
-
-
-class LinuxLogicalInterface(object):
+class LogicalInterface(object):
     def __init__(self, phy_iface, ip, metric=1, activated=False):
         self.phy_iface = phy_iface
         self.ip = ipaddr.IPv4Network(ip)
         self.activated = activated
         self.metric = metric
-
-    def usable(self):
-        return self.phy_iface.usable()
 
 
 class ModifyRouteError(Exception):
