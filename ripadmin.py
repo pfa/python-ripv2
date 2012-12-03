@@ -1,4 +1,21 @@
 #!/usr/bin/env python
+#
+# Administrative interface for the RIP server.
+# Copyright (C) 2012 Patrick F. Allen
+# 
+# This program is free software; you can redistribute it and/or
+# modify it under the terms of the GNU General Public License
+# as published by the Free Software Foundation; either version 2
+# of the License, or (at your option) any later version.
+# 
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+# 
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
 
 from cmd import Cmd
 from twisted.internet import protocol, reactor
@@ -60,7 +77,7 @@ class RIPAdminCLI(Cmd):
         """Subscribe to log messages from a subsystem.
         Usage: terminal_monitor <SUBSYSTEM> <level>
         SUBSYSTEM can be: RIP, SYSTEM
-        LEVEL can be: OFF, CRITICAL, ERROR, WARNING, INFO, DEBUG"""
+        LEVEL can be any valid logging level (debug1, error, etc.) or OFF."""
         args = line.split()
         if len(args) != 2:
             self.usage()
@@ -68,12 +85,7 @@ class RIPAdminCLI(Cmd):
         subsystem = args[0].upper()
         level = args[1].upper()
 
-        if level not in [ "OFF",
-                          "CRITICAL",
-                          "ERROR",
-                          "WARNING",
-                          "INFO",
-                          "DEBUG" ]:
+        if level not in logging._levelNames and not level == "OFF":
             self.stdout.write("Bad logging level.\n")
             self.usage()
             return

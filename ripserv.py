@@ -1,5 +1,7 @@
 #!/usr/bin/env python
-#
+
+"""A Python implementation of RIPv2."""
+
 # Python-RIPv2 -- A Python implementation of RIPv2.
 # Copyright (C) 2012 Patrick F. Allen
 # 
@@ -47,13 +49,13 @@ class RIP(protocol.DatagramProtocol):
     def __init__(self, port=520, user_routes=None, importroutes=False,
                  requested_ifaces=None, log_config="logging.conf",
                  base_timer=None):
-        """port -- The UDP port to listen and send on (default 520).
+        """port -- The UDP port to listen and send on.
         user_routes -- A list of routes to advertise.
         importroutes -- If True, look in the main kernel routing table for
             routes to import into RIP during startup.
         requested_ifaces -- A list of interface names to send updates out of.
             If None, use all interfaces.
-        log_config -- The logging config file (default logging.conf)
+        log_config -- The logging config file.
         base_timer -- Influences update/garbage/timeout timers"""
         self.init_logging(log_config)
         self.log.info("RIP is starting up...")
@@ -103,6 +105,10 @@ class RIP(protocol.DatagramProtocol):
 
         if importroutes:
             for rt in self._sys.get_local_routes():
+                if rt.network.ip.is_loopback   or \
+                   rt.network.ip.is_link_local or \
+                   rt.network.ip.is_multicast:
+                    continue
                 self.try_add_route(rt, nexthop, False)
 
         self.activate_ifaces(requested_ifaces)
@@ -516,17 +522,10 @@ class _RIPSystem(object):
         self._route_change = False
 
     def modify_route(self, rt):
-        """Update the system routing table to use a new metric and nexthop
-        for the given prefix.
-
-        Since only one path to a prefix should be in the system routing table,
-        a minimum implementation of this function would consist of a call to
-        self.uninstall_route(rt) followed by a call to self.install_route(rt).
-        If the OS support modifying routes (both Windows and Linux do) without
-        using a delete followed by an add, that could also be used.
-
-        Override in subclass."""
-        assert(False)
+        """Update the metric and nexthop address to a prefix."""
+        self.uninstall_route(rt.network.ip.exploded, rt.network.prefixlen)
+        self.install_route(rt.network.ip.exploded, rt.network.prefixlen,
+                           rt.metric, rt.nexthop)
 
     def cleanup(self):
         """Clean up the system. Called when exiting.
@@ -568,10 +567,11 @@ class _RIPSystem(object):
     def is_self(self, host):
         """Determines if an IP address belongs to the local machine.
 
-        Returns True if so, otherwise returns False.
-
-        Override in subclass."""
-        assert(False)
+        Returns True if so, otherwise returns False."""
+        for iface in self.logical_ifaces:
+            if host == iface.ip.ip.exploded:
+                return True
+        return False
 
 
 class WindowsRIPSystem(_RIPSystem):
@@ -580,24 +580,21 @@ class WindowsRIPSystem(_RIPSystem):
     def __init__(self, *args, **kwargs):
         super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
 
-    def modify_route(self, rt):
-        pass
-
     def cleanup(self):
         pass
 
     def update_interface_info(self):
         ipconfig_output = subprocess.check_output("ipconfig")
-        
+
         self.phy_ifaces = []
         self.logical_ifaces = []
 
         # XXX Extract actual physical interfaces... though these aren't really
         # used now anyway except for debug messages.
-        self.phy_ifaces.append(PhysicalInterface("WindowsPhysicalInterface",
-                               None))
+        self.phy_ifaces.append(PhysicalInterface("GenericWindowsPhy", None))
         for ip in re.findall("IPv4 Address.*: (.*)\r", ipconfig_output):
-            self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0], ip))        
+            self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0],
+                                       ip))
 
     def uninstall_route(self, net, mask):
         pass
@@ -606,10 +603,25 @@ class WindowsRIPSystem(_RIPSystem):
         pass
 
     def get_local_routes(self):
-        return []
+        output = subprocess.check_output("route print",
+                                         stderr=subprocess.STDOUT)
+        routes = re.search("IPv4 Route Table.*?^ (.*?)=", output,
+                           re.DOTALL | re.MULTILINE).group(1)
 
-    def is_self(self, host):
-        return True
+        local_routes = []
+        for rtline in routes.splitlines():
+            rtinfo = rtline.split()
+            dst_network = rtinfo[0]
+            mask = rtinfo[1]
+            parsed_network = ipaddr.IPv4Network(dst_network + "/" + mask)
+
+            rte = RIPRouteEntry(address=parsed_network.ip.exploded,
+                                mask=parsed_network.netmask.exploded,
+                                nexthop="0.0.0.0",
+                                metric=0,
+                                tag=0)
+            local_routes.append(rte)
+        return local_routes
 
 
 class LinuxRIPSystem(_RIPSystem):
@@ -637,12 +649,6 @@ class LinuxRIPSystem(_RIPSystem):
         if self.priority > 32767 or self.priority < 0:
             raise(ValueError)
         self._install_rule()
-
-    def modify_route(self, rt):
-        """Update the metric and nexthop address to a prefix."""
-        self.uninstall_route(rt.network.ip.exploded, rt.network.prefixlen)
-        self.install_route(rt.network.ip.exploded, rt.network.prefixlen,
-                           rt.metric, rt.nexthop)
 
     def _install_rule(self):
         cmd = [self.IP_CMD] + ("rule add priority %d table %d" % \
@@ -728,13 +734,6 @@ class LinuxRIPSystem(_RIPSystem):
     def cleanup(self):
         """Perform any necessary system cleanup."""
         self._uninstall_rule()
-
-    def is_self(self, host):
-        """Determines if an IP address belongs to the local machine."""
-        for iface in self.logical_ifaces:
-            if host == iface.ip.ip.exploded:
-                return True
-        return False
 
 
 class PhysicalInterface(object):
