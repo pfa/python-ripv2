@@ -105,9 +105,13 @@ class RIP(protocol.DatagramProtocol):
 
         if importroutes:
             for rt in self._sys.get_local_routes():
+                # Windows includes all local routes, including /32 routes
+                # for local interfaces, in its main routing table. Filter
+                # most of those out.
                 if rt.network.ip.is_loopback   or \
                    rt.network.ip.is_link_local or \
-                   rt.network.ip.is_multicast:
+                   rt.network.ip.is_multicast  or \
+                   rt.network.ip.exploded == "255.255.255.255":
                     continue
                 self.try_add_route(rt, nexthop, False)
 
@@ -140,6 +144,29 @@ class RIP(protocol.DatagramProtocol):
         self.log.info("RIP is shutting down.")
         self.cleanup()
 
+    def _act_on_routes_before_time(self, action, cond, before_time):
+        """Take an action on a route if its timeout is less than a given time.
+        Doesn't count routes that don't meet the given condition (cond) or
+        if their timeout is set to None.
+
+        Returns the highest rt.timeout value greater than before_time, or
+        before_time if no timeout values were greater than before_time."""
+        now = datetime.datetime.now()
+        lowest_timer = before_time
+
+        for rt in self._routes:
+            if not cond(rt):
+                continue
+            if rt.timeout == None:
+                continue
+
+            if rt.timeout < before_time:
+                action(rt)
+            else:
+                lowest_timer = max(lowest_timer, rt.timeout)
+
+        return lowest_timer
+
     def _start_garbage_collection(self, rt):
         if rt.garbage:
             self.log.debug2("Route was already on GC: %s" % rt)
@@ -156,24 +183,19 @@ class RIP(protocol.DatagramProtocol):
 
     def _check_route_timeouts(self):
         self.log.debug2("Checking route timeouts...")
+        action = self._start_garbage_collection
+        cond = lambda x: not x.garbage
         now = datetime.datetime.now()
-        begin_invalid_time = now - datetime.timedelta(seconds=self.timeout_timer)
-        timeout_val = datetime.timedelta(seconds=self.timeout_timer)
-        lowest_timer = timeout_val
+        timeout_delta = datetime.timedelta(seconds=self.timeout_timer)
+        before_time = now - timeout_delta
 
-        for rt in self._routes:
-            if not rt.garbage:
-                if rt.timeout == None:
-                    continue
-                if rt.timeout < begin_invalid_time:
-                    self.log.debug2("Adding route to GC: %s" % rt)
-                    self._start_garbage_collection(rt)
-                else:
-                    current_timer = (rt.timeout + timeout_val) - now
-                    lowest_timer = min(lowest_timer,
-                                        current_timer)
+        lowest_time = self._act_on_routes_before_time(action, cond,
+                                                      before_time)
+        if lowest_time == before_time:
+            next_call_time = ((now + timeout_delta) - now).total_seconds()
+        else:
+            next_call_time = (lowest_time - now + timeout_delta).total_seconds() + 1
 
-        next_call_time = lowest_timer.total_seconds() + 1
         self.log.debug2("Checking timeouts again in %d second(s)" %
                        next_call_time)
         reactor.callLater(next_call_time, self._check_route_timeouts)
@@ -181,35 +203,36 @@ class RIP(protocol.DatagramProtocol):
     def _init_garbage_collection_timer(self):
         if self._gc_started:
             return
+        self._gc_started = True
         reactor.callLater(self.garbage_timer, self._collect_garbage_routes)
 
     def _collect_garbage_routes(self):
+        # XXX Roll more of this into _act_on_routes_before_time. Pass in
+        # self.garbage_timer.
+        # Return value should be the next time to call the function, or
+        # None if it shouldn't be called again (no gc routes).
         self.log.debug2("Collecting garbage routes...")
+        action = self._uninstall_route
+        cond = lambda x: x.garbage
         now = datetime.datetime.now()
-        flush_before = now - datetime.timedelta(seconds=self.garbage_timer)
-        max_wait_time = self.garbage_timer + 1
-        lowest_route_timer = max_wait_time
+        timeout_delta = datetime.timedelta(seconds=self.garbage_timer)
+        before_time = now - timeout_delta
 
-        for rt in self._routes:
-            if rt.garbage:
-                if rt.timeout == None:
-                    continue
-                if rt.timeout < flush_before:
-                    self.log.debug2("Deleting route: %s" % rt)
-                    self._sys.uninstall_route(rt.network.ip.exploded,
-                                              rt.network.prefixlen)
-                    self._routes.remove(rt)
-                else:
-                    lowest_route_timer = min(datetime.timedelta(seconds=self.garbage_timer), lowest_route_timer)
-
-        if lowest_route_timer == max_wait_time:
+        lowest_time = self._act_on_routes_before_time(action, cond,
+                                                      before_time)
+        if lowest_time == before_time:
             self.log.debug2("No more routes on GC.")
             self._gc_started = False
         else:
-            next_call_time = (now - lowest_route_timer).total_seconds() + 1
-            self.log.debug2("Collecting garbage routes again in %d seconds" %
-                           next_call_time)
+            next_call_time = (lowest_time - now + timeout_delta).total_seconds() + 1
+            self.log.debug2("GC running again in %d second(s)" %
+                            next_call_time)
             reactor.callLater(next_call_time, self._collect_garbage_routes)
+
+    def _uninstall_route(self, rt):
+        self.log.debug2("Deleting route: %s" % rt)
+        self._sys.uninstall_route(rt.network.ip.exploded, rt.network.prefixlen)
+        self._routes.remove(rt)
 
     def init_logging(self, log_config):
         # debug1 is less verbose, debug5 is more verbose.
