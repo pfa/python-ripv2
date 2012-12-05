@@ -2,7 +2,7 @@
 
 """A Python implementation of RIPv2."""
 
-# Python-RIPv2 -- A Python implementation of RIPv2.
+# ripserv.py
 # Copyright (C) 2012 Patrick F. Allen
 # 
 # This program is free software; you can redistribute it and/or
@@ -144,14 +144,20 @@ class RIP(protocol.DatagramProtocol):
         self.log.info("RIP is shutting down.")
         self.cleanup()
 
-    def _act_on_routes_before_time(self, action, cond, before_time):
+    def _act_on_routes_before_time(self, action, cond, timer):
         """Take an action on a route if its timeout is less than a given time.
         Doesn't count routes that don't meet the given condition (cond) or
         if their timeout is set to None.
 
-        Returns the highest rt.timeout value greater than before_time, or
-        before_time if no timeout values were greater than before_time."""
+        timer is a number of seconds that will determine when the next call
+        time should be.
+
+        Returns the next time this function should be called based on the
+        rt.timeout values, or returns None if no values were greater than
+        before_time."""
         now = datetime.datetime.now()
+        timeout_delta = datetime.timedelta(seconds=timer)
+        before_time = now - timeout_delta
         lowest_timer = before_time
 
         for rt in self._routes:
@@ -165,7 +171,10 @@ class RIP(protocol.DatagramProtocol):
             else:
                 lowest_timer = max(lowest_timer, rt.timeout)
 
-        return lowest_timer
+        if lowest_timer == before_time:
+            return None
+        else:
+            return (lowest_timer + timeout_delta - now).total_seconds() + 1
 
     def _start_garbage_collection(self, rt):
         if rt.garbage:
@@ -186,15 +195,12 @@ class RIP(protocol.DatagramProtocol):
         action = self._start_garbage_collection
         cond = lambda x: not x.garbage
         now = datetime.datetime.now()
-        timeout_delta = datetime.timedelta(seconds=self.timeout_timer)
-        before_time = now - timeout_delta
 
-        lowest_time = self._act_on_routes_before_time(action, cond,
-                                                      before_time)
-        if lowest_time == before_time:
-            next_call_time = ((now + timeout_delta) - now).total_seconds()
-        else:
-            next_call_time = (lowest_time - now + timeout_delta).total_seconds() + 1
+        next_call_time = self._act_on_routes_before_time(action, cond,
+                                              self.timeout_timer)
+
+        if not next_call_time:
+            next_call_time = self.timeout_timer
 
         self.log.debug2("Checking timeouts again in %d second(s)" %
                        next_call_time)
@@ -207,27 +213,25 @@ class RIP(protocol.DatagramProtocol):
         reactor.callLater(self.garbage_timer, self._collect_garbage_routes)
 
     def _collect_garbage_routes(self):
-        # XXX Roll more of this into _act_on_routes_before_time. Pass in
-        # self.garbage_timer.
-        # Return value should be the next time to call the function, or
-        # None if it shouldn't be called again (no gc routes).
         self.log.debug2("Collecting garbage routes...")
-        action = self._uninstall_route
+        action = lambda x: setattr(x, "marked_for_deletion", True)
         cond = lambda x: x.garbage
         now = datetime.datetime.now()
-        timeout_delta = datetime.timedelta(seconds=self.garbage_timer)
-        before_time = now - timeout_delta
 
-        lowest_time = self._act_on_routes_before_time(action, cond,
-                                                      before_time)
-        if lowest_time == before_time:
+        next_call_time = self._act_on_routes_before_time(action, cond,
+                                               self.garbage_timer)
+        if not next_call_time:
             self.log.debug2("No more routes on GC.")
             self._gc_started = False
         else:
-            next_call_time = (lowest_time - now + timeout_delta).total_seconds() + 1
             self.log.debug2("GC running again in %d second(s)" %
                             next_call_time)
             reactor.callLater(next_call_time, self._collect_garbage_routes)
+
+        # Check for deletion flag and *safely* delete those routes
+        for rt in self._routes[:]:
+            if rt.marked_for_deletion:
+                self._uninstall_route(rt)
 
     def _uninstall_route(self, rt):
         self.log.debug2("Deleting route: %s" % rt)
@@ -893,6 +897,8 @@ class RIPRouteEntry(object):
         self.imported = imported
         self.init_timeout()
         self.garbage = False
+        self.marked_for_deletion = False
+
         if rawdata and src_ip:
             self._init_from_net(rawdata, src_ip)
         elif address and \
