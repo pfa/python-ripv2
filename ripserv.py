@@ -606,8 +606,8 @@ class WindowsRIPSystem(_RIPSystem):
 
     CMD_BASE = "route %(action)s"
     OPTS_BASE = "%(network)s mask %(mask)s"
-    ROUTE_DEL = CMD_BASE % "delete" + OPTS_BASE
-    ROUTE_ADD = CMD_BASE % "add" + OPTS_BASE + " %(nh)s metric %(metric)d"
+    ROUTE_DEL = CMD_BASE % {"action": "delete"} + OPTS_BASE
+    ROUTE_ADD = CMD_BASE % {"action": "add"} + OPTS_BASE + " %(nh)s metric %(metric)d"
 
     def __init__(self, *args, **kwargs):
         super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
@@ -626,11 +626,12 @@ class WindowsRIPSystem(_RIPSystem):
         self.phy_ifaces.append(PhysicalInterface("GenericWindowsPhy", None))
         masks = re.findall("Subnet Mask.*: (.*)\r", ipconfig_output)
         ips = re.findall("IPv4 Address.*: (.*)\r", ipconfig_output)
+        assert(len(ips) == len(masks))
         mapper = lambda ip, mask: ip + "/" + mask
 
-        for net in map(mapper, ips, snmasks):
+        for net in map(mapper, ips, masks):
             self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0],
-                                       net))
+                                                        net))
 
     def uninstall_route(self, net, preflen):
         # Convert the prefix length into a dotted decimal mask
