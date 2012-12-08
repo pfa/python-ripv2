@@ -605,7 +605,7 @@ class WindowsRIPSystem(_RIPSystem):
     """The Windows interface for RIP."""
 
     CMD_BASE = "route %(action)s"
-    OPTS_BASE = "%(network)s mask %(mask)s"
+    OPTS_BASE = " %(network)s mask %(mask)s"
     ROUTE_DEL = CMD_BASE % {"action": "delete"} + OPTS_BASE
     ROUTE_ADD = CMD_BASE % {"action": "add"} + OPTS_BASE + " %(nh)s metric %(metric)d"
 
@@ -635,25 +635,27 @@ class WindowsRIPSystem(_RIPSystem):
 
     def uninstall_route(self, net, preflen):
         # Convert the prefix length into a dotted decimal mask
-        mask = preflen_to_snmask(preflen)
-        cmd = ROUTE_DEL % { "network": net,
-                            "mask": mask,
-                          }
+        mask = self.preflen_to_snmask(preflen)
+        cmd = self.ROUTE_DEL % { "network": net,
+                                 "mask": mask,
+                               }
         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         if not "OK!" in output:
             raise ModifyRouteError("uninstall", output)
 
     def install_route(self, net, preflen, metric, nexthop):
-        mask = preflen_to_snmask(preflen)
-        cmd = ROUTE_ADD % { "network": net,
-                             "mask":   mask,
-                          }
+        mask = self.preflen_to_snmask(preflen)
+        cmd = self.ROUTE_ADD % { "network": net,
+                                 "mask":    mask,
+                                 "metric":  metric,
+                                 "nh":      nexthop,
+                               }
 
         output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         if not "OK!" in output:
             raise ModifyRouteError("uninstall", output)
-        ROUTE_CMD = "route %(action)s %(network)s mask %(mask)s %(nh)s metric %(metric)d"
 
+    @staticmethod
     def preflen_to_snmask(preflen):
         return ipaddr.IPv4Network("0.0.0.0/%d" % preflen).netmask
 
