@@ -604,6 +604,11 @@ class _RIPSystem(object):
 class WindowsRIPSystem(_RIPSystem):
     """The Windows interface for RIP."""
 
+    CMD_BASE = "route %(action)s"
+    OPTS_BASE = "%(network)s mask %(mask)s"
+    ROUTE_DEL = CMD_BASE % "delete" + OPTS_BASE
+    ROUTE_ADD = CMD_BASE % "add" + OPTS_BASE + " %(nh)s metric %(metric)d"
+
     def __init__(self, *args, **kwargs):
         super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
 
@@ -619,15 +624,37 @@ class WindowsRIPSystem(_RIPSystem):
         # XXX Extract actual physical interfaces... though these aren't really
         # used now anyway except for debug messages.
         self.phy_ifaces.append(PhysicalInterface("GenericWindowsPhy", None))
-        for ip in re.findall("IPv4 Address.*: (.*)\r", ipconfig_output):
-            self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0],
-                                       ip))
+        masks = re.findall("Subnet Mask.*: (.*)\r", ipconfig_output)
+        ips = re.findall("IPv4 Address.*: (.*)\r", ipconfig_output)
+        mapper = lambda ip, mask: ip + "/" + mask
 
-    def uninstall_route(self, net, mask):
-        pass
+        for net in map(mapper, ips, snmasks):
+            self.logical_ifaces.append(LogicalInterface(self.phy_ifaces[0],
+                                       net))
+
+    def uninstall_route(self, net, preflen):
+        # Convert the prefix length into a dotted decimal mask
+        mask = preflen_to_snmask(preflen)
+        cmd = ROUTE_DEL % { "network": net,
+                            "mask": mask,
+                          }
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        if not "OK!" in output:
+            raise ModifyRouteError("uninstall", output)
 
     def install_route(self, net, preflen, metric, nexthop):
-        pass
+        mask = preflen_to_snmask(preflen)
+        cmd = ROUTE_ADD % { "network": net,
+                             "mask":   mask,
+                          }
+
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
+        if not "OK!" in output:
+            raise ModifyRouteError("uninstall", output)
+        ROUTE_CMD = "route %(action)s %(network)s mask %(mask)s %(nh)s metric %(metric)d"
+
+    def preflen_to_snmask(preflen):
+        return ipaddr.IPv4Network("0.0.0.0/%d" % preflen).netmask
 
     def get_local_routes(self):
         output = subprocess.check_output("route print",
@@ -715,9 +742,9 @@ class LinuxRIPSystem(_RIPSystem):
                 logical_iface = LogicalInterface(phy_iface, addr)
                 self.logical_ifaces.append(logical_iface)
 
-    def uninstall_route(self, net, mask):
+    def uninstall_route(self, net, preflen):
         cmd = [self.IP_CMD] + ("route del %s/%s table %d" % \
-               (net, mask, self.table)).split()
+               (net, preflen, self.table)).split()
         try:
             output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
