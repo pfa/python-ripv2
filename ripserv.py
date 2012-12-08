@@ -30,11 +30,13 @@ import logging
 import logging.config
 import random
 import datetime
+import traceback
+import os
+import ctypes
 from twisted.internet import protocol
 from twisted.internet import reactor
 from twisted.python import log
 import twisted.python.failure
-import traceback
 
 import ripadmin
 
@@ -1054,12 +1056,17 @@ def parse_args(argv):
 def main(argv):
     options, arguments = parse_args(argv)
 
-    # Must run as root to manipulate the routing table.
-    if sys.platform.startswith("linux"):
-        userid = subprocess.check_output("id -u".split()).rstrip()
-        if userid != "0":
-            sys.stderr.write("Must run as root. Exiting.\n")
-            sys.exit(1)
+    # Must run as root/admin to manipulate the routing table.
+    # Cross-platform method below.
+    # See: http://stackoverflow.com/questions/1026431/crossplatform-way-to-check-admin-rights-in-python-script
+    try:
+        is_admin = os.getuid() == 0
+    except AttributeError:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+
+    if is_admin != "0":
+        sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
+        sys.exit(1)
 
     ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer)
     reactor.listenMulticast(options.port, ripserv)
