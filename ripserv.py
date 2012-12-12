@@ -448,6 +448,8 @@ class RIP(protocol.DatagramProtocol):
         trigger_suppression_timeout = \
                             datetime.timedelta(seconds=random.randrange(1, 5))
 
+        # TODO: Sometimes two triggered updates are sent one after the other.
+        # That shouldn't happen. Haven't look at it at all yet.
         if self._last_trigger_time + trigger_suppression_timeout > \
            current_time:
             self._send_triggered_update()
@@ -678,7 +680,8 @@ class WindowsRIPSystem(_RIPSystem):
                                 mask=parsed_network.netmask.exploded,
                                 nexthop="0.0.0.0",
                                 metric=0,
-                                tag=0)
+                                tag=0,
+                                imported=True)
             local_routes.append(rte)
         return local_routes
 
@@ -1064,7 +1067,7 @@ def main(argv):
     except AttributeError:
         is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
 
-    if is_admin != "0":
+    if is_admin == 0:
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
         sys.exit(1)
 
