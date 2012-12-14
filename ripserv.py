@@ -61,6 +61,7 @@ class RIP(protocol.DatagramProtocol):
         base_timer -- Influences update/garbage/timeout timers"""
         self.init_logging(log_config)
         self.log.info("RIP is starting up...")
+        self._suppress_triggered_updates = False
 
         log.addObserver(self._suppress_reactor_not_running)
 
@@ -118,7 +119,7 @@ class RIP(protocol.DatagramProtocol):
                 self.try_add_route(rt, nexthop, False)
 
         self.activate_ifaces(requested_ifaces)
-        self._last_trigger_time = datetime.datetime.now()
+        self._last_update_time = datetime.datetime.now()
 
         # Setup admin interface
         ripadmin.start(self)
@@ -136,7 +137,7 @@ class RIP(protocol.DatagramProtocol):
         # to stop happening "the right way". Since I never call reactor.stop
         # it seems like this is twisted's problem. This is kludgey but it
         # works, and it shouldn't block any useful messages from being printed.
-        if msg['isError'] and msg["failure"].type == \
+        if msg["isError"] and msg["failure"].type == \
            twisted.internet.error.ReactorNotRunning:
             self.log.info("FIXME: Suppressing ReactorNotRunning error.")
             for k in msg:
@@ -189,7 +190,7 @@ class RIP(protocol.DatagramProtocol):
         rt.init_timeout()
         rt.metric = RIPRouteEntry.MAX_METRIC
         self._sys.modify_route(rt)
-        self.handle_route_change()
+        self._route_change = True
         self._init_garbage_collection_timer()
 
     def _check_route_timeouts(self):
@@ -200,6 +201,9 @@ class RIP(protocol.DatagramProtocol):
 
         next_call_time = self._act_on_routes_before_time(action, cond,
                                               self.timeout_timer)
+
+        if self._route_change:
+            self._send_triggered_update()
 
         if not next_call_time:
             next_call_time = self.timeout_timer
@@ -220,8 +224,17 @@ class RIP(protocol.DatagramProtocol):
         cond = lambda x: x.garbage
         now = datetime.datetime.now()
 
+        # XXX FIXME GC's next_call_time is 1 second when there is a group
+        # of routes to be deleted. Fix this so it will lenient enough to
+        # encompass the whole group if possible.
         next_call_time = self._act_on_routes_before_time(action, cond,
                                                self.garbage_timer)
+
+        # Check for deletion flag and *safely* delete those routes
+        for rt in self._routes[:]:
+            if rt.marked_for_deletion:
+                self._uninstall_route(rt)
+
         if not next_call_time:
             self.log.debug2("No more routes on GC.")
             self._gc_started = False
@@ -229,11 +242,6 @@ class RIP(protocol.DatagramProtocol):
             self.log.debug2("GC running again in %d second(s)" %
                             next_call_time)
             reactor.callLater(next_call_time, self._collect_garbage_routes)
-
-        # Check for deletion flag and *safely* delete those routes
-        for rt in self._routes[:]:
-            if rt.marked_for_deletion:
-                self._uninstall_route(rt)
 
     def _uninstall_route(self, rt):
         self.log.debug2("Deleting route: %s" % rt)
@@ -243,10 +251,10 @@ class RIP(protocol.DatagramProtocol):
     def init_logging(self, log_config):
         # debug1 is less verbose, debug5 is more verbose.
         for (level, name) in [ (10, "DEBUG1"),
-                               (9, "DEBUG2"),
-                               (8, "DEBUG3"),
-                               (7, "DEBUG4"),
-                               (6, "DEBUG5"),
+                               (9,  "DEBUG2"),
+                               (8,  "DEBUG3"),
+                               (7,  "DEBUG4"),
+                               (6,  "DEBUG5"),
                              ]:
             self._create_new_log_level(level, name)
 
@@ -282,6 +290,7 @@ class RIP(protocol.DatagramProtocol):
         if not dst_port:
             dst_port = self.port
 
+        self._last_update_time = datetime.datetime.now()
         self.log.debug2("Sending an update. Triggered = %d." % triggered)
         hdr = RIPHeader(cmd=RIPHeader.TYPE_RESPONSE, ver=2).serialize()
 
@@ -392,7 +401,6 @@ class RIP(protocol.DatagramProtocol):
                 self.log.debug5("Advertisement source port was not the RIP "
                                "port.  Ignoring.")
                 return
-
             self.process_response(msg, host)
         else:
             self.log.warn("Received a packet with a command field that was "
@@ -435,22 +443,21 @@ class RIP(protocol.DatagramProtocol):
 
     def process_response(self, msg, host):
         for rte in msg.rtes:
-            # XXX Should update to use the metric of the incoming interface
             rte.metric = min(rte.metric + 1, RIPRouteEntry.MAX_METRIC)
             self.try_add_route(rte, host)
+        if self._route_change:
+            self.handle_route_change()
 
     def handle_route_change(self):
-        if self._route_change:
+        if self._suppress_triggered_updates:
             return
+        self._suppress_triggered_updates = True
 
-        self._route_change = True
         current_time = datetime.datetime.now()
         trigger_suppression_timeout = \
                             datetime.timedelta(seconds=random.randrange(1, 5))
 
-        # TODO: Sometimes two triggered updates are sent one after the other.
-        # That shouldn't happen. Haven't look at it at all yet.
-        if self._last_trigger_time + trigger_suppression_timeout > \
+        if self._last_update_time + trigger_suppression_timeout < \
            current_time:
             self._send_triggered_update()
         else:
@@ -458,11 +465,14 @@ class RIP(protocol.DatagramProtocol):
                               self._send_triggered_update)
 
     def _send_triggered_update(self):
-        self.log.debug2("Sending triggered update.")
-        self._route_change = False
         self.generate_update(triggered=True)
+        self._route_change = False
+        self._suppress_triggered_updates = False
 
     def try_add_route(self, rte, host, install=True):
+        """Install a route via the given host. If install is False, the
+        route is not added to the system routing table and a triggered
+        update is not requested."""
         self.log.debug5("try_add_route: Received %s" % rte)
         bestroute = self.get_route(rte.network.ip.exploded,
                                    rte.network.netmask.exploded)
@@ -477,7 +487,7 @@ class RIP(protocol.DatagramProtocol):
 
             if not install:
                 return
-            self.handle_route_change()
+            self._route_change = True
             self._sys.install_route(rte.network.ip.exploded,
                                     rte.network.prefixlen, rte.metric,
                                     rte.nexthop)
@@ -503,7 +513,7 @@ class RIP(protocol.DatagramProtocol):
         oldrt.metric = newrt.metric
         oldrt.nexthop = newrt.nexthop
         self._sys.modify_route(oldrt)
-        self.handle_route_change()
+        self._route_change = True
 
     def get_route(self, net, mask):
         for rt in self._routes:
@@ -550,7 +560,6 @@ class _RIPSystem(object):
         self.init_logging(kwargs["log_config"])
         self.update_interface_info()
         self.loopback = "127.0.0.1"
-        self._route_change = False
 
     def modify_route(self, rt):
         """Update the metric and nexthop address to a prefix."""
