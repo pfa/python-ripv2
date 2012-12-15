@@ -284,7 +284,7 @@ class RIP(protocol.DatagramProtocol):
             if iface.activated == True:
                 self.transport.joinGroup("224.0.0.9", iface.ip.ip.exploded)
 
-    def generate_update(self, triggered=False, ifaces=None, routes=None,
+    def generate_update(self, triggered=False, ifaces=None,
                         dst_ip="224.0.0.9", dst_port=None, split_horizon=True):
         """Send an update message across the network."""
         if not dst_port:
@@ -299,17 +299,12 @@ class RIP(protocol.DatagramProtocol):
         else:
             ifaces_to_use = ifaces
 
-        if not routes:
-            routes_to_use = self._routes
-        else:
-            routes_to_use = routes
-
         for iface in ifaces_to_use:
             msg = hdr
             self.log.debug4("Preparing update for interface %s" %
                            iface.phy_iface.name)
             route_count = 0
-            for rt in routes_to_use:
+            for rt in self._routes:
                 self.log.debug5("Trying to add route to update: %s." % rt)
                 if split_horizon and rt.nexthop in iface.ip:
                     self.log.debug5("Split horizon prevents sending route.")
@@ -317,7 +312,10 @@ class RIP(protocol.DatagramProtocol):
                 if triggered and not rt.changed:
                     self.log.debug5("Route not changed. Skipping.")
                     continue
+                saved_nexthop = rt.nexthop.exploded
+                rt.set_nexthop("0.0.0.0")
                 msg += rt.serialize()
+                rt.set_nexthop(saved_nexthop)
                 self.log.debug5("Adding route to update.")
                 route_count += 1
                 if route_count == self.MAX_ROUTES_PER_UPDATE:
