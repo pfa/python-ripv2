@@ -50,7 +50,7 @@ class RIP(protocol.DatagramProtocol):
 
     def __init__(self, port=520, user_routes=None, importroutes=False,
                  requested_ifaces=None, log_config="logging.conf",
-                 base_timer=None):
+                 base_timer=None, admin_port=5120):
         """port -- The UDP port to listen and send on.
         user_routes -- A list of routes to advertise.
         importroutes -- If True, look in the main kernel routing table for
@@ -92,7 +92,7 @@ class RIP(protocol.DatagramProtocol):
         nexthop = "0.0.0.0"
 
         if user_routes:
-            metric = 0
+            metric = 1
             tag = 0
 
             for route in user_routes:
@@ -122,7 +122,7 @@ class RIP(protocol.DatagramProtocol):
         self._last_update_time = datetime.datetime.now()
 
         # Setup admin interface
-        ripadmin.start(self)
+        ripadmin.start(self, port=admin_port)
 
         reactor.callWhenRunning(self.generate_periodic_update)
         reactor.callWhenRunning(self._check_route_timeouts)
@@ -137,8 +137,11 @@ class RIP(protocol.DatagramProtocol):
         # to stop happening "the right way". Since I never call reactor.stop
         # it seems like this is twisted's problem. This is kludgey but it
         # works, and it shouldn't block any useful messages from being printed.
-        if msg["isError"] and msg["failure"].type == \
-           twisted.internet.error.ReactorNotRunning:
+        if not msg.has_key("isError") or \
+           not msg.has_key("failure"):
+            return
+        if msg["isError"] and \
+           msg["failure"].type == twisted.internet.error.ReactorNotRunning:
             self.log.info("FIXME: Suppressing ReactorNotRunning error.")
             for k in msg:
                 msg[k] = None
@@ -312,7 +315,20 @@ class RIP(protocol.DatagramProtocol):
                 if triggered and not rt.changed:
                     self.log.debug5("Route not changed. Skipping.")
                     continue
+
+                # Use 0.0.0.0 as the nexthop unless the nexthop router is
+                # a different router on the same subnet. Since split horizon
+                # is always used, this should only happen when a route is
+                # imported by this RIP process in a manner that is not
+                # currently implemented -- namely, an imported route
+                # would have to meet the conditions in the first sentence of
+                # this comment.
                 saved_nexthop = rt.nexthop.exploded
+                if rt.nexthop in iface.ip and \
+                   rt.nexthop != iface.ip.ip:
+                    nexthop = rt.nexthop.exploded
+                else:
+                    nexthop = "0.0.0.0"
                 rt.set_nexthop("0.0.0.0")
                 msg += rt.serialize()
                 rt.set_nexthop(saved_nexthop)
@@ -686,7 +702,7 @@ class WindowsRIPSystem(_RIPSystem):
             rte = RIPRouteEntry(address=parsed_network.ip.exploded,
                                 mask=parsed_network.netmask.exploded,
                                 nexthop="0.0.0.0",
-                                metric=0,
+                                metric=1,
                                 tag=0,
                                 imported=True)
             local_routes.append(rte)
@@ -781,7 +797,7 @@ class LinuxRIPSystem(_RIPSystem):
             raise #ModifyRouteError("route_install", output)
 
         local_routes = []
-        metric = 0
+        metric = 1
         tag = 0
         nexthop = "0.0.0.0"
         for route in output.splitlines():
@@ -1035,8 +1051,10 @@ class NotSupported(_RIPException):
 
 def parse_args(argv):
     op = optparse.OptionParser()
-    op.add_option("-p", "--port", default=520, type="int",
-                  help="The port number to use (520)")
+    op.add_option("-p", "--rip-port", default=520, type="int",
+                  help="RIP port number to use (520)")
+    op.add_option("-P", "--admin-port", default=1520, type="int",
+                  help="Admin telnet interface port number to use (1520)")
     op.add_option("-i", "--interface", type="str", action="append",
                   help="An interface IP to use for RIP. "
                        "Can specify -i multiple times.")
@@ -1078,8 +1096,8 @@ def main(argv):
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
         sys.exit(1)
 
-    ripserv = RIP(options.port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer)
-    reactor.listenMulticast(options.port, ripserv)
+    ripserv = RIP(options.rip_port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer, options.admin_port)
+    reactor.listenMulticast(options.rip_port, ripserv)
     reactor.run()
 
 if __name__ == "__main__":
