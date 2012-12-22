@@ -942,6 +942,34 @@ class RIPHeader(object):
         return struct.pack(self.FORMAT, self.cmd, self.ver, 0)
 
 
+class RIPSimpleAuthEntry(object):
+    """Simple plain text password authentication as defined in RFC 1723
+    section 3.1."""
+    FORMAT = ">HH16s"
+    SIZE = struct.calcsize(FORMAT)
+
+    def __init__(self, password):
+        """password should be the plain text password to use and must not
+        be longer than 16 bytes."""
+        self.afi = 0xffff
+        self.auth_type = 0x0002
+        self.password = password
+
+    @property
+    def password(self):
+        return self._password
+
+    @password.setter
+    def password(self, password):
+        if len(password) > 16:
+            raise(ValueError("Password too long (>16 bytes)."))
+        self._password = password
+
+    def serialize(self):
+        return struct.pack(self.FORMAT, self.afi, self.auth_type,
+                           self.password)
+
+
 class RIPRouteEntry(object):
     FORMAT = ">HHIIII"
     SIZE = struct.calcsize(FORMAT)
