@@ -160,7 +160,7 @@ class RIP(protocol.DatagramProtocol):
 
         Returns the next time this function should be called based on the
         rt.timeout values, or returns None if no values were greater than
-        before_time."""
+        timer."""
         now = datetime.datetime.now()
         timeout_delta = datetime.timedelta(seconds=timer)
         before_time = now - timeout_delta
@@ -320,9 +320,8 @@ class RIP(protocol.DatagramProtocol):
                 # a different router on the same subnet. Since split horizon
                 # is always used, this should only happen when a route is
                 # imported by this RIP process in a manner that is not
-                # currently implemented -- namely, an imported route
-                # would have to meet the conditions in the first sentence of
-                # this comment.
+                # currently implemented -- all imported routes are given
+                # a nexthop of 0.0.0.0.
                 saved_nexthop = rt.nexthop.exploded
                 if rt.nexthop in iface.ip and \
                    rt.nexthop != iface.ip.ip:
@@ -948,12 +947,19 @@ class RIPSimpleAuthEntry(object):
     FORMAT = ">HH16s"
     SIZE = struct.calcsize(FORMAT)
 
-    def __init__(self, password):
+    def __init__(self, rawdata=None, password=None):
         """password should be the plain text password to use and must not
         be longer than 16 bytes."""
-        self.afi = 0xffff
-        self.auth_type = 0x0002
-        self.password = password
+        if rawdata and password != None:
+            raise(ValueError("only one of rawdata or password are allowed."))
+        elif rawdata:
+            self._init_from_net(rawdata)
+        elif password != None:
+            self.afi = 0xffff
+            self.auth_type = 0x0002
+            self.password = password
+        else:
+            raise(ValueError("rawdata or password must be provided."))
 
     @property
     def password(self):
@@ -964,6 +970,12 @@ class RIPSimpleAuthEntry(object):
         if len(password) > 16:
             raise(ValueError("Password too long (>16 bytes)."))
         self._password = password
+
+    def _init_from_net(self, rawdata):
+        rte = struct.unpack(self.FORMAT, rawdata)
+        self.afi = rte[0]
+        self.auth_type = rte[1]
+        self.password = rte[2]
 
     def serialize(self):
         return struct.pack(self.FORMAT, self.afi, self.auth_type,
