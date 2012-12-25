@@ -1017,7 +1017,11 @@ class RIPRouteEntry(object):
         self.tag = tag
 
     def set_network(self, address, mask):
-        self.network = ipaddr.IPv4Network(address + "/" + str(mask))
+        # If the given address and mask is not a network ID, make it one by
+        # ANDing the addr and mask.
+        network = ipaddr.IPv4Network(address + "/" + str(mask))
+        self.network = ipaddr.IPv4Network(network.network.exploded + "/" +
+                                          str(network.prefixlen))
 
     def set_nexthop(self, nexthop):
         self.nexthop = ipaddr.IPv4Address(nexthop)
