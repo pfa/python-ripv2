@@ -126,6 +126,17 @@ class RIP(protocol.DatagramProtocol):
 
         reactor.callWhenRunning(self.generate_periodic_update)
         reactor.callWhenRunning(self._check_route_timeouts)
+        reactor.callWhenRunning(self.send_request)
+
+    def send_request(self):
+        """Send a multicast request message out of each active interface."""
+        hdr = RIPHeader(cmd=RIPHeader.TYPE_REQUEST, ver=2)
+        rte = [ RIPRouteEntry(afi=0, address="0.0.0.0", mask=0, tag=0,
+                 metric=RIPRouteEntry.MAX_METRIC, nexthop="0.0.0.0") ]
+        request = RIPPacket(hdr=hdr, rtes=rte).serialize()
+
+        for iface in self.get_active_ifaces():
+            self.send_update(request, iface.ip.ip.exploded)
 
     def _suppress_reactor_not_running(self, msg):
         # reactor apparently calls reactor.stop() more than once when shutting
@@ -389,8 +400,11 @@ class RIP(protocol.DatagramProtocol):
                 break
 
         if not link_local:
-            self.log.warn("Received advertisement from non link-local "
-                          "host. Ignoring.")
+            self.log.warn("Ignoring advertisement from non link-local host.")
+            return
+
+        if host_local:
+            self.log.debug5("Ignoring message from local system.")
             return
 
         try:
@@ -407,12 +421,9 @@ class RIP(protocol.DatagramProtocol):
         if msg.hdr.cmd == RIPHeader.TYPE_REQUEST:
             self.process_request(msg, host, port, local_iface)
         elif msg.hdr.cmd == RIPHeader.TYPE_RESPONSE:
-            if host_local:
-                self.log.debug5("Ignoring message from local system.")
-                return
             if port != self.port:
                 self.log.debug5("Advertisement source port was not the RIP "
-                               "port.  Ignoring.")
+                               "port. Ignoring.")
                 return
             self.process_response(msg, host)
         else:
