@@ -1134,7 +1134,12 @@ def main(argv):
     try:
         is_admin = os.getuid() == 0
     except AttributeError:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        try:
+            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+        except AttributeError:
+            sys.stderr.write("Unable to check if you are running as a \n"
+                             "privileged user. You may be using an \n"
+                             "unsupported OS.")
 
     if is_admin == 0:
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
