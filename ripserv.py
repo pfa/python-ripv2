@@ -1142,6 +1142,7 @@ def main(argv):
     # Must run as root/admin to manipulate the routing table.
     # Cross-platform method below.
     # See: http://stackoverflow.com/questions/1026431/crossplatform-way-to-check-admin-rights-in-python-script
+    is_admin = False
     try:
         is_admin = os.getuid() == 0
     except AttributeError:
@@ -1151,14 +1152,15 @@ def main(argv):
             sys.stderr.write("Unable to check if you are running as a \n"
                              "privileged user. You may be using an \n"
                              "unsupported OS.")
+            return 1
 
     if is_admin == 0:
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
-        sys.exit(1)
+        return 1
 
     ripserv = RIP(options.rip_port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer, options.admin_port)
     reactor.listenMulticast(options.rip_port, ripserv)
-    reactor.run()
+    return reactor.run()
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
