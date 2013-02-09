@@ -85,7 +85,6 @@ class RIP(protocol.DatagramProtocol):
             raise(NotSupported("No support for current OS."))
         self.port = port
         self._routes = []
-        self._garbage_routes = []
 
         # Nexthop of 0.0.0.0 tells receivers to use the source IP on the
         # packet for the nexthop address. See RFC 2453 section 4.4.
@@ -295,7 +294,7 @@ class RIP(protocol.DatagramProtocol):
 
     def startProtocol(self):
         for iface in self._sys.logical_ifaces:
-            if iface.activated == True:
+            if iface.activated:
                 self.transport.joinGroup("224.0.0.9", iface.ip.ip.exploded)
 
     def generate_update(self, triggered=False, ifaces=None,
@@ -1154,7 +1153,7 @@ def main(argv):
                              "unsupported OS.")
             return 1
 
-    if is_admin == 0:
+    if not is_admin:
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
         return 1
 
