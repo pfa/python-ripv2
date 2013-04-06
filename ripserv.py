@@ -20,7 +20,6 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301, USA.
 
 import struct
-import ipaddr
 import sys
 import optparse
 import binascii
@@ -31,10 +30,17 @@ import datetime
 import traceback
 import os
 import ctypes
-from twisted.internet import protocol
-from twisted.internet import reactor
-from twisted.python import log
-import twisted.python.failure
+
+try:
+    import ipaddr
+    from twisted.internet import protocol
+    from twisted.internet import reactor
+    from twisted.python import log
+    import twisted.python.failure
+except ImportError:
+    sys.stderr.write("ERROR: Could not find all required libraries. See the System Setup section on this page: %s" % "http://code.google.com/p/python-ripv2/wiki/UsingPythonRIPv2\n")
+    sys.stderr.write("Exception was:\n")
+    raise
 
 import ripadmin
 import sysiface
@@ -383,8 +389,10 @@ class RIP(protocol.DatagramProtocol):
         self.transport.setOutgoingInterface(src_iface_ip)
         self.transport.write(msg, (dst_ip, dst_port))
 
-    def datagramReceived(self, data, (host, port)):
+    def datagramReceived(self, data, host_and_port):
         self.log.debug2("Processing a datagram from host %s." % host)
+        host = host_and_port[0]
+        port = host_and_port[1]
 
         link_local = False
         host_local = False
@@ -859,7 +867,7 @@ def parse_args(argv):
 
 def main(argv):
     if not (0x02070000 < sys.hexversion < 0x02080000):
-        sys.stderr.write("Python 2.7 is required.")
+        sys.stderr.write("Python 2.7 is required. Exiting.")
         return 1
     options, arguments = parse_args(argv)
 
