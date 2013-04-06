@@ -390,10 +390,9 @@ class RIP(protocol.DatagramProtocol):
         self.transport.write(msg, (dst_ip, dst_port))
 
     def datagramReceived(self, data, host_and_port):
-        self.log.debug2("Processing a datagram from host %s." % host)
         host = host_and_port[0]
         port = host_and_port[1]
-
+        self.log.debug2("Processing a datagram from host %s." % host)
         link_local = False
         host_local = False
         host = ipaddr.IPv4Address(host)
