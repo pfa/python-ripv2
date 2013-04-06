@@ -126,6 +126,8 @@ class RIP(protocol.DatagramProtocol):
         reactor.callWhenRunning(self.generate_periodic_update)
         reactor.callWhenRunning(self._check_route_timeouts)
         reactor.callWhenRunning(self.send_request)
+        reactor.listenMulticast(port, self)
+        reactor.run()
 
     def send_request(self):
         """Send a multicast request message out of each active interface."""
@@ -210,7 +212,6 @@ class RIP(protocol.DatagramProtocol):
         self.log.debug2("Checking route timeouts...")
         action = self._start_garbage_collection
         cond = lambda x: not x.garbage
-        now = datetime.datetime.now()
 
         next_call_time = self._act_on_routes_before_time(action, cond,
                                               self.timeout_timer)
@@ -235,10 +236,9 @@ class RIP(protocol.DatagramProtocol):
         self.log.debug2("Collecting garbage routes...")
         action = lambda x: setattr(x, "marked_for_deletion", True)
         cond = lambda x: x.garbage
-        now = datetime.datetime.now()
 
         # XXX FIXME GC's next_call_time is 1 second when there is a group
-        # of routes to be deleted. Fix this so it will lenient enough to
+        # of routes to be deleted. Fix this so it will be lenient enough to
         # encompass the whole group if possible.
         next_call_time = self._act_on_routes_before_time(action, cond,
                                                self.garbage_timer)
@@ -338,7 +338,7 @@ class RIP(protocol.DatagramProtocol):
                     nexthop = rt.nexthop.exploded
                 else:
                     nexthop = "0.0.0.0"
-                rt.set_nexthop("0.0.0.0")
+                rt.set_nexthop(nexthop)
                 msg += rt.serialize()
                 rt.set_nexthop(saved_nexthop)
                 self.log.debug5("Adding route to update.")
@@ -1136,6 +1136,9 @@ def parse_args(argv):
     return options, arguments
 
 def main(argv):
+    if not (0x02070000 < sys.hexversion < 0x02080000):
+        sys.stderr.write("Python 2.7 is required.")
+        return 1
     options, arguments = parse_args(argv)
 
     # Must run as root/admin to manipulate the routing table.
@@ -1157,9 +1160,7 @@ def main(argv):
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
         return 1
 
-    ripserv = RIP(options.rip_port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer, options.admin_port)
-    reactor.listenMulticast(options.rip_port, ripserv)
-    return reactor.run()
+    RIP(options.rip_port, options.route, options.import_routes, options.interface, options.log_config, options.base_timer, options.admin_port)
 
 if __name__ == "__main__":
     sys.exit(main(sys.argv))
