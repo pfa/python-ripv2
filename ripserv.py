@@ -111,16 +111,17 @@ class RIP(protocol.DatagramProtocol):
                 self.try_add_route(rte, nexthop, False)
 
         if importroutes:
-            for rt in self._sys.get_local_routes():
+            for net, mask in self._sys.get_local_routes():
                 # Windows includes all local routes, including /32 routes
                 # for local interfaces, in its main routing table. Filter
                 # most of those out.
-                if rt.network.ip.is_loopback   or \
-                   rt.network.ip.is_link_local or \
-                   rt.network.ip.is_multicast  or \
-                   rt.network.ip.exploded == "255.255.255.255":
-                    continue
-                self.try_add_route(rt, nexthop, False)
+                rte = RIPRouteEntry(address=net,
+                                    mask=mask,
+                                    nexthop="0.0.0.0",
+                                    metric=1,
+                                    tag=0,
+                                    imported=True)
+                self.try_add_route(rte, nexthop, False)
 
         self.activate_ifaces(requested_ifaces)
         self._last_update_time = datetime.datetime.now()
@@ -159,7 +160,7 @@ class RIP(protocol.DatagramProtocol):
             return
         if msg["isError"] and \
            msg["failure"].type == twisted.internet.error.ReactorNotRunning:
-            self.log.info("FIXME: Suppressing ReactorNotRunning error.")
+            self.log.debug5("FIXME: Suppressing ReactorNotRunning error.")
             for k in msg:
                 msg[k] = None
 

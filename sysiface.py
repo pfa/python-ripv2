@@ -160,23 +160,17 @@ class WindowsRIPSystem(_RIPSystem):
                                          stderr=subprocess.STDOUT)
         routes = re.search("IPv4 Route Table.*?^ (.*?)=", output,
                            re.DOTALL | re.MULTILINE).group(1)
-
-        local_routes = []
         for rtline in routes.splitlines():
             rtinfo = rtline.split()
             dst_network = rtinfo[0]
             mask = rtinfo[1]
             parsed_network = ipaddr.IPv4Network(dst_network + "/" + mask)
-
-            rte = RIPRouteEntry(address=parsed_network.ip.exploded,
-                                mask=parsed_network.netmask.exploded,
-                                nexthop="0.0.0.0",
-                                metric=1,
-                                tag=0,
-                                imported=True)
-            local_routes.append(rte)
-        return local_routes
-
+            if rt.network.ip.is_loopback   or \
+               rt.network.ip.is_link_local or \
+               rt.network.ip.is_multicast  or \
+               rt.network.ip.exploded == "255.255.255.255":
+                continue
+            yield (parsed_network.ip.exploded, parsed_network.netmask.exploded)
 
 class LinuxRIPSystem(_RIPSystem):
     """The Linux interface for RIP."""
@@ -264,26 +258,14 @@ class LinuxRIPSystem(_RIPSystem):
             output = subprocess.check_output(cmd, stderr=subprocess.STDOUT)
         except subprocess.CalledProcessError:
             raise #ModifyRouteError("route_install", output)
-
-        local_routes = []
-        metric = 1
-        tag = 0
-        nexthop = "0.0.0.0"
         for route in output.splitlines():
             dst_network = route.split()[0]
+
             # Default route shows up as the word 'default'
             if dst_network == "default":
                 dst_network = "0.0.0.0/0"
             parsed_network = ipaddr.IPv4Network(dst_network)
-
-            rte = RIPRouteEntry(address=parsed_network.ip.exploded,
-                                mask=parsed_network.netmask.exploded,
-                                nexthop=nexthop,
-                                metric=metric,
-                                tag=tag,
-                                imported=True)
-            local_routes.append(rte)
-        return local_routes
+            yield (parsed_network.ip.exploded, parsed_network.netmask.exploded)
 
     def cleanup(self):
         """Perform any necessary system cleanup."""
