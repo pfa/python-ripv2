@@ -282,4 +282,4 @@ class LogicalInterface(object):
         self.phy_iface = phy_iface 
         self.ip = ipaddr.IPv4Network(ip) 
         self.activated = activated 
-        self.metric = metric 
+        self.metric = metric

@@ -28,6 +28,7 @@ import logging.config
 import random
 import datetime
 import traceback
+import functools
 
 try:
     import ipaddr
@@ -67,7 +68,8 @@ class RIP(protocol.DatagramProtocol):
         self.log.info("RIP is starting up...")
         self._suppress_triggered_updates = False
 
-        log.addObserver(self._suppress_reactor_not_running)
+        suppress_reactor_not_running = functools.partial(util.suppress_reactor_not_running, logfunc=self.log.debug)
+        log.addObserver(suppress_reactor_not_running)
 
         if not base_timer:
             base_timer = self.DEFAULT_UPDATE_TIMER
@@ -143,25 +145,6 @@ class RIP(protocol.DatagramProtocol):
 
         for iface in self.get_active_ifaces():
             self.send_update(request, iface.ip.ip.exploded)
-
-    def _suppress_reactor_not_running(self, msg):
-        # reactor apparently calls reactor.stop() more than once when shutting
-        # down under certain circumstances, like when a signal goes uncaught
-        # (e.g. CTRL+C). It only does this sometimes. It prints a stacktrace
-        # to the console. I see several old (now-fixed) bug reports relating
-        # to this and some stackexchange threads discussing how to suppress
-        # these kinds of messages, but nothing that tells me how to get this
-        # to stop happening "the right way". Since I never call reactor.stop
-        # it seems like this is twisted's problem. This is kludgey but it
-        # works, and it shouldn't block any useful messages from being printed.
-        if not msg.has_key("isError") or \
-           not msg.has_key("failure"):
-            return
-        if msg["isError"] and \
-           msg["failure"].type == twisted.internet.error.ReactorNotRunning:
-            self.log.debug5("FIXME: Suppressing ReactorNotRunning error.")
-            for k in msg:
-                msg[k] = None
 
     def stopProtocol(self):
         self.log.info("RIP is shutting down.")
