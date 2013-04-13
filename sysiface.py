@@ -2,7 +2,6 @@
 
 """Interface to the OS."""
 
-# ripserv.py 
 # Copyright (C) 2012 Patrick F. Allen 
 #  
 # This program is free software; you can redistribute it and/or 
@@ -25,10 +24,10 @@ import re
 import logging
 import logging.config
 
-class _RIPSystem(object):
-    """Abstract class for OS-specific functions needed by RIP. These are all
-    the OS-specific methods that need to be overridden by a subclass in order
-    to make RIP functional on a different OS (e.g. Windows)."""
+class _System(object):
+    """Abstract class for OS-specific functions. These are all the OS-specific
+    methods that need to be overridden by a subclass in order to function on a
+    different OS."""
 
     def init_logging(self, log_config):
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
@@ -82,7 +81,7 @@ class _RIPSystem(object):
     def get_local_routes(self):
         """Retrieves routes from the system routing table.
 
-        Return value is a list of RIPRouteEntry objects defining local routes.
+        Return value is a list of (address, mask) tuples defining local routes.
 
         Override in subclass."""
         assert(False)
@@ -97,8 +96,8 @@ class _RIPSystem(object):
         return False
 
 
-class WindowsRIPSystem(_RIPSystem):
-    """The Windows interface for RIP."""
+class WindowsSystem(_System):
+    """The Windows system interface."""
 
     CMD_BASE = "route %(action)s"
     OPTS_BASE = " %(network)s mask %(mask)s"
@@ -106,7 +105,7 @@ class WindowsRIPSystem(_RIPSystem):
     ROUTE_ADD = CMD_BASE % {"action": "add"} + OPTS_BASE + " %(nh)s metric %(metric)d"
 
     def __init__(self, *args, **kwargs):
-        super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
+        super(_System, self).__thisclass__.__init__(self, *args, **kwargs)
 
     def cleanup(self):
         pass
@@ -172,8 +171,8 @@ class WindowsRIPSystem(_RIPSystem):
                 continue
             yield (parsed_network.ip.exploded, parsed_network.netmask.exploded)
 
-class LinuxRIPSystem(_RIPSystem):
-    """The Linux interface for RIP."""
+class LinuxSystem(_System):
+    """The Linux system interface."""
 
     IP_CMD = "/sbin/ip"
     RT_DEL_ARGS = "route del %(net)s/%(mask)s"
@@ -183,11 +182,11 @@ class LinuxRIPSystem(_RIPSystem):
     def __init__(self, table=52, priority=1000, *args, **kwargs):
         """Args:
         table -- the routing table to install routes to (if applicable on
-            the platform RIP is running on).
-        priority -- the desirability of routes learned by the RIP process
-            relative to other routing daemons (if applicable on the platform
-            RIP is running on)."""
-        super(_RIPSystem, self).__thisclass__.__init__(self, *args, **kwargs)
+            the current platform).
+        priority -- the desirability of routes learned by the process
+            relative to other routing daemons (if applicable on the current
+            platform"""
+        super(_System, self).__thisclass__.__init__(self, *args, **kwargs)
 
         self.table = table
         self.priority = priority
@@ -272,13 +271,13 @@ class LinuxRIPSystem(_RIPSystem):
         self._uninstall_rule()
 
 
-class PhysicalInterface(object): 
+class PhysicalInterface(object):
     def __init__(self, name, flags): 
         self.name = name 
         self._flags = flags 
  
  
-class LogicalInterface(object): 
+class LogicalInterface(object):
     def __init__(self, phy_iface, ip, metric=1, activated=False): 
         self.phy_iface = phy_iface 
         self.ip = ipaddr.IPv4Network(ip) 

@@ -44,6 +44,7 @@ except ImportError:
 
 import ripadmin
 import sysiface
+import util
 
 class RIP(protocol.DatagramProtocol):
     """An implementation of RIPv2 using the twisted asynchronous networking
@@ -83,9 +84,9 @@ class RIP(protocol.DatagramProtocol):
         self._route_change = False
         self._gc_started = False
         if sys.platform == "linux2":
-            self._sys = sysiface.LinuxRIPSystem(log_config=log_config)
+            self._sys = sysiface.LinuxSystem(log_config=log_config)
         elif sys.platform.startswith("win"):
-            self._sys = sysiface.WindowsRIPSystem(log_config=log_config)
+            self._sys = sysiface.WindowsSystem(log_config=log_config)
         else:
             raise(NotSupported("No support for current OS."))
         self.port = port
@@ -275,7 +276,7 @@ class RIP(protocol.DatagramProtocol):
                                (7,  "DEBUG4"),
                                (6,  "DEBUG5"),
                              ]:
-            self._create_new_log_level(level, name)
+            util.create_new_log_level(level, name)
 
         logging.config.fileConfig(log_config, disable_existing_loggers=True)
         self.log = logging.getLogger("RIP")
@@ -562,16 +563,6 @@ class RIP(protocol.DatagramProtocol):
             if rt.nexthop.exploded != "0.0.0.0":
                 self._sys.uninstall_route(rt.network.ip.exploded,
                                           rt.network.prefixlen)
-
-    # See my comment here:
-    # http://stackoverflow.com/questions/2183233/how-to-add-a-custom-loglevel-to-pythons-logging-facility
-    @staticmethod
-    def _create_new_log_level(level, name):
-        def newlog(self, msg, level=level, *args, **kwargs):
-            if self.isEnabledFor(level):
-                self._log(level, msg, args, **kwargs)
-        logging.addLevelName(level, name)
-        setattr(logging.Logger, name.lower(), newlog)
 
 
 class ModifyRouteError(Exception):
