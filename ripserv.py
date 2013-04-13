@@ -28,8 +28,6 @@ import logging.config
 import random
 import datetime
 import traceback
-import os
-import ctypes
 
 try:
     import ipaddr
@@ -863,21 +861,7 @@ def main(argv):
     options, arguments = parse_args(argv)
 
     # Must run as root/admin to manipulate the routing table.
-    # Cross-platform method below.
-    # See: http://stackoverflow.com/questions/1026431/crossplatform-way-to-check-admin-rights-in-python-script
-    is_admin = False
-    try:
-        is_admin = os.getuid() == 0
-    except AttributeError:
-        try:
-            is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-        except AttributeError:
-            sys.stderr.write("Unable to check if you are running as a \n"
-                             "privileged user. You may be using an \n"
-                             "unsupported OS.")
-            return 1
-
-    if not is_admin:
+    if not util.is_admin():
         sys.stderr.write("Must run as a privileged user (root/admin/etc.). Exiting.\n")
         return 1
 
